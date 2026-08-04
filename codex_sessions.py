@@ -1,0 +1,493 @@
+#!/usr/bin/env python3
+"""Save running WSL Codex sessions and reopen them in Windows Terminal."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import signal
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import textwrap
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+SESSION_ID = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+TOKENS = re.compile(r"[^\W\d_]+|\d+")
+STATE_VERSION = 1
+DISTRO = os.environ.get("CODEX_SESSIONS_DISTRO", "Ubuntu")
+WSL_PYTHON = os.environ.get("CODEX_SESSIONS_WSL_PYTHON", "/usr/bin/python3")
+
+
+def short_title(value: str | None, cwd: str, session_id: str) -> str:
+    value = " ".join((value or "").split())
+    if not value:
+        value = Path(cwd).name or session_id[:8]
+    return value if len(value) <= 72 else value[:69] + "..."
+
+
+def paint(code: str, value: object) -> str:
+    enabled = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+    return f"\033[{code}m{value}\033[0m" if enabled else str(value)
+
+
+def print_session_card(
+    index: int,
+    session: dict[str, object],
+    metadata: str,
+    context: str | None = None,
+) -> None:
+    print(f"\n{paint('96', f'[{index}]')} {paint('1', session['title'])}")
+    if context:
+        width = max(40, min(100, shutil.get_terminal_size().columns - 4))
+        excerpt = textwrap.fill(
+            f"> {context}",
+            width,
+            initial_indent="    ",
+            subsequent_indent="    ",
+            break_long_words=False,
+            break_on_hyphens=False,
+        )
+        print(paint("37", excerpt))
+    print(f"    {metadata}")
+    print(f"    {paint('2', session['cwd'])}")
+
+
+def session_from_rollout(path: Path, pid: int | None = None) -> dict[str, object] | None:
+    try:
+        with path.open(encoding="utf-8") as stream:
+            payload = json.loads(next(stream))["payload"]
+        session_id = payload["id"]
+        cwd = payload["cwd"]
+    except (OSError, StopIteration, KeyError, TypeError, json.JSONDecodeError):
+        return None
+    if not SESSION_ID.fullmatch(session_id) or not isinstance(cwd, str):
+        return None
+    session: dict[str, object] = {"id": session_id, "cwd": cwd}
+    if pid is not None:
+        session["pid"] = pid
+    return session
+
+
+def thread_labels(codex_home: Path, session_ids: list[str]) -> dict[str, str]:
+    if not session_ids:
+        return {}
+    placeholders = ",".join("?" for _ in session_ids)
+    database = codex_home / "state_5.sqlite"
+    try:
+        with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
+            rows = connection.execute(
+                f"SELECT id, COALESCE(NULLIF(name, ''), title) FROM threads "
+                f"WHERE id IN ({placeholders})",
+                session_ids,
+            )
+        return {session_id: label for session_id, label in rows if label}
+    except sqlite3.Error:
+        return {}
+
+
+def discover_wsl_sessions() -> list[dict[str, object]]:
+    codex_home = Path.home() / ".codex"
+    sessions_root = str(codex_home / "sessions") + os.sep
+    found: dict[str, dict[str, object]] = {}
+
+    for process in Path("/proc").iterdir():
+        if not process.name.isdigit():
+            continue
+        try:
+            if Path(os.readlink(process / "exe")).name != "codex":
+                continue
+            descriptors = (process / "fd").iterdir()
+        except (OSError, PermissionError):
+            continue
+
+        for descriptor in descriptors:
+            try:
+                target = os.readlink(descriptor)
+            except OSError:
+                continue
+            if not target.startswith(sessions_root) or not target.endswith(".jsonl"):
+                continue
+            session = session_from_rollout(Path(target), int(process.name))
+            if session:
+                found[str(session["id"])] = session
+
+    labels = thread_labels(codex_home, list(found))
+    for session_id, session in found.items():
+        session["title"] = short_title(labels.get(session_id), str(session["cwd"]), session_id)
+    return sorted(found.values(), key=lambda session: (str(session["title"]).lower(), str(session["id"])))
+
+
+def windows_command(name: str) -> str:
+    command = shutil.which(name)
+    if not command:
+        raise SystemExit(f"Required Windows command is missing from PATH: {name}")
+    return command
+
+
+def run_in_wsl(*arguments: str) -> str:
+    wsl = windows_command("wsl.exe")
+    python_check = subprocess.run(
+        [wsl, "-d", DISTRO, "--", "test", "-x", WSL_PYTHON],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if python_check.returncode:
+        raise SystemExit(f"Required dependency missing: {DISTRO} WSL with {WSL_PYTHON}")
+    script = Path(__file__).read_text(encoding="utf-8")
+    result = subprocess.run(
+        [wsl, "-d", DISTRO, "--", WSL_PYTHON, "-", *arguments],
+        check=True,
+        capture_output=True,
+        encoding="utf-8",
+        input=script,
+    )
+    return result.stdout
+
+
+def discover_from_windows() -> list[dict[str, object]]:
+    return json.loads(run_in_wsl("_discover"))
+
+
+def searchable_message(line: str) -> str | None:
+    if '"type":"event_msg"' not in line or not (
+        '"type":"user_message"' in line or '"type":"agent_message"' in line
+    ):
+        return None
+    try:
+        message = json.loads(line)["payload"]["message"]
+    except (KeyError, TypeError, json.JSONDecodeError):
+        return None
+    return message if isinstance(message, str) else None
+
+
+def context_excerpt(message: str, terms: list[str]) -> str:
+    text = re.sub(r"\[([^]]+)]\([^)]+\)", r"\1", " ".join(message.split()))
+    folded = text.casefold()
+    position = next((folded.find(term) for term in reversed(terms) if term in folded), 0)
+    start = max(0, position - 60)
+    end = min(len(text), start + 180)
+    return ("..." if start else "") + text[start:end] + ("..." if end < len(text) else "")
+
+
+def search_wsl_sessions(query: str) -> list[dict[str, object]]:
+    terms = TOKENS.findall(query.casefold())
+    if not terms:
+        return []
+    matches: list[dict[str, object]] = []
+
+    for path in (Path.home() / ".codex" / "sessions").rglob("*.jsonl"):
+        counts = dict.fromkeys(terms, 0)
+        best_context = ""
+        best_quality = (0, 0)
+        session = session_from_rollout(path)
+        if not session:
+            continue
+        try:
+            with path.open(encoding="utf-8") as stream:
+                for line in stream:
+                    message = searchable_message(line)
+                    if message is None:
+                        continue
+                    words = TOKENS.findall(message.casefold())
+                    hits = [words.count(term) for term in terms]
+                    for term, count in zip(terms, hits):
+                        counts[term] += count
+                    quality = (sum(bool(count) for count in hits), sum(hits))
+                    if quality > best_quality:
+                        best_quality = quality
+                        best_context = context_excerpt(message, terms)
+        except OSError:
+            continue
+        if all(counts.values()):
+            session["score"] = min(counts.values())
+            session["date"] = "-".join(path.parts[-4:-1])
+            session["context"] = best_context
+            matches.append(session)
+
+    labels = thread_labels(Path.home() / ".codex", [str(item["id"]) for item in matches])
+    for session in matches:
+        session_id = str(session["id"])
+        session["title"] = short_title(labels.get(session_id), str(session["cwd"]), session_id)
+    return sorted(
+        matches,
+        key=lambda item: (int(item["score"]), str(item["date"])),
+        reverse=True,
+    )[:10]
+
+
+def find_sessions(query: str) -> int:
+    sessions = (
+        json.loads(run_in_wsl("_search", query))
+        if os.name == "nt"
+        else search_wsl_sessions(query)
+    )
+    if not sessions:
+        print(f"No sessions found for: {query}")
+        return 1
+
+    print(paint("1", f"Found {len(sessions)} likely session(s) for: {query}"))
+    for index, session in enumerate(sessions, 1):
+        score = paint("93", f"score {session['score']}")
+        metadata = (
+            f"{score}  "
+            f"{paint('92', session['date'])}  {paint('95', session['id'])}"
+        )
+        print_session_card(index, session, metadata, str(session["context"]))
+
+    if os.name == "nt" and sys.stdin.isatty() and sys.stdout.isatty():
+        while True:
+            choice = input("\nOpen session [number, Enter to cancel]: ").strip()
+            if not choice:
+                break
+            if choice.isdigit() and 1 <= int(choice) <= len(sessions):
+                session = sessions[int(choice) - 1]
+                wt = windows_command("wt.exe")
+                wsl = windows_command("wsl.exe")
+                cwd = str(session["cwd"])
+                if not wsl_directory_exists(wsl, cwd):
+                    print(paint("91", f"Missing WSL directory: {cwd}"))
+                    return 1
+                subprocess.Popen(
+                    launch_command(session, wt, wsl),
+                    close_fds=True,
+                )
+                print(paint("92", f"Opened: {session['title']}"))
+                break
+            print(
+                paint("91", f"Choose a number from 1 to {len(sessions)}, or press Enter.")
+            )
+    return 0
+
+
+def terminate_sessions(sessions: list[dict[str, object]]) -> None:
+    pids = [int(session["pid"]) for session in sessions]
+    if os.name == "nt":
+        subprocess.run(
+            [windows_command("wsl.exe"), "-d", DISTRO, "--", "/bin/kill", "-TERM", *map(str, pids)],
+            check=False,
+        )
+    else:
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+
+def state_file() -> Path:
+    return Path(__file__).resolve().with_name("sessions.json")
+
+
+def save_sessions(dry_run: bool, kill: bool) -> int:
+    live_sessions = discover_from_windows() if os.name == "nt" else discover_wsl_sessions()
+    if not live_sessions:
+        print(
+            paint("91", "No running interactive Codex sessions found; existing save kept."),
+            file=sys.stderr,
+        )
+        return 1
+    sessions = [
+        {key: session[key] for key in ("id", "cwd", "title")}
+        for session in live_sessions
+    ]
+
+    manifest = {
+        "version": STATE_VERSION,
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "sessions": sessions,
+    }
+    if not dry_run:
+        destination = state_file()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=destination.parent, delete=False
+        ) as stream:
+            json.dump(manifest, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            temporary = Path(stream.name)
+        temporary.replace(destination)
+
+    action = "Would save" if dry_run else "Saved"
+    status = paint("93" if dry_run else "92", action.lower())
+    print(paint("1", f"{action} {len(sessions)} session(s)"))
+    for index, session in enumerate(sessions, 1):
+        print_session_card(index, session, f"{status}  {paint('95', session['id'])}")
+    if kill:
+        if dry_run:
+            print(
+                paint(
+                    "93", f"\nWould send SIGTERM to {len(live_sessions)} Codex process(es)."
+                )
+            )
+        else:
+            terminate_sessions(live_sessions)
+            print(paint("93", f"\nSent SIGTERM to {len(live_sessions)} Codex process(es)."))
+    elif not dry_run:
+        print(
+            paint(
+                "96", "\nSessions were not killed; close Windows Terminal after active turns finish."
+            )
+        )
+    return 0
+
+
+def load_manifest() -> dict[str, object]:
+    try:
+        manifest = json.loads(state_file().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise SystemExit(f"Cannot read {state_file()}: {error}") from error
+    if manifest.get("version") != STATE_VERSION or not isinstance(manifest.get("sessions"), list):
+        raise SystemExit(f"Unsupported or invalid save file: {state_file()}")
+    return manifest
+
+
+def launch_command(session: dict[str, object], wt: str, wsl: str) -> list[str]:
+    session_id = str(session.get("id", ""))
+    cwd = str(session.get("cwd", ""))
+    if not SESSION_ID.fullmatch(session_id) or not cwd.startswith("/"):
+        raise ValueError(f"Invalid saved session: {session!r}")
+    title = short_title(str(session.get("title") or ""), cwd, session_id)
+    return [
+        wt,
+        "-w",
+        "new",
+        "nt",
+        "--title",
+        title,
+        "--suppressApplicationTitle",
+        wsl,
+        "-d",
+        DISTRO,
+        "--cd",
+        cwd,
+        "bash",
+        "-lic",
+        f"exec codex resume {session_id}",
+    ]
+
+
+def wsl_directory_exists(wsl: str, cwd: str) -> bool:
+    return subprocess.run(
+        [wsl, "-d", DISTRO, "--", "test", "-d", cwd],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ).returncode == 0
+
+
+def restore_sessions(dry_run: bool) -> int:
+    if os.name != "nt":
+        raise SystemExit("restoreSessions must run from Windows PowerShell.")
+
+    manifest = load_manifest()
+    wt = windows_command("wt.exe")
+    wsl = windows_command("wsl.exe")
+    codex_check = subprocess.run(
+        [wsl, "-d", DISTRO, "--", "bash", "-lic", "command -v codex >/dev/null"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if codex_check.returncode:
+        raise SystemExit(f"Required dependency missing: codex in the {DISTRO} login shell")
+    running = {str(session["id"]) for session in discover_from_windows()}
+    launched = 0
+    action = "Would restore" if dry_run else "Restoring"
+    print(paint("1", f"{action} {len(manifest['sessions'])} saved session(s)"))
+
+    for index, session in enumerate(manifest["sessions"], 1):
+        session_id = str(session.get("id", ""))
+        if session_id in running:
+            print_session_card(
+                index,
+                session,
+                f"{paint('96', 'already running')}  {paint('95', session_id)}",
+            )
+            continue
+        command = launch_command(session, wt, wsl)
+        cwd = str(session["cwd"])
+        if not wsl_directory_exists(wsl, cwd):
+            print_session_card(
+                index,
+                session,
+                f"{paint('91', 'missing directory')}  {paint('95', session_id)}",
+            )
+            continue
+        if dry_run:
+            status = paint("93", "would restore")
+        else:
+            subprocess.Popen(command, close_fds=True)
+            status = paint("92", "restored")
+        print_session_card(index, session, f"{status}  {paint('95', session_id)}")
+        launched += 1
+
+    summary = "Would restore" if dry_run else "Restored"
+    print(paint("1", f"\n{summary} {launched} session(s)."))
+    return 0 if launched or running else 1
+
+
+def self_test() -> int:
+    session_id = "01234567-89ab-cdef-0123-456789abcdef"
+    assert short_title("  a   useful title ", "/tmp/work", session_id) == "a useful title"
+    assert short_title(None, "/tmp/work", session_id) == "work"
+    command = launch_command(
+        {"id": session_id, "cwd": "/tmp/a b", "title": "test"},
+        "wt.exe",
+        "wsl.exe",
+    )
+    assert command[-4:] == ["/tmp/a b", "bash", "-lic", f"exec codex resume {session_id}"]
+    line = json.dumps(
+        {"type": "event_msg", "payload": {"type": "user_message", "message": "task42 ready"}},
+        separators=(",", ":"),
+    )
+    assert searchable_message(line) == "task42 ready"
+    assert searchable_message('{"type":"response_item","message":"task 42"}') is None
+    assert "task42" in context_excerpt("before task42 after", ["task", "42"])
+    print("Self-test passed.")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    save = subparsers.add_parser("save", help="save running WSL Codex sessions")
+    save.add_argument("--dry-run", action="store_true")
+    save.add_argument(
+        "--kill",
+        action="store_true",
+        help="after saving, send SIGTERM to the found Codex processes",
+    )
+    restore = subparsers.add_parser("restore", help="reopen the saved sessions")
+    restore.add_argument("--dry-run", action="store_true")
+    find = subparsers.add_parser("find", help="find likely sessions by conversation text")
+    find.add_argument("query", nargs="+")
+    subparsers.add_parser("self-test")
+    subparsers.add_parser("_discover", help=argparse.SUPPRESS)
+    search = subparsers.add_parser("_search", help=argparse.SUPPRESS)
+    search.add_argument("query")
+    args = parser.parse_args()
+
+    if args.command == "save":
+        return save_sessions(args.dry_run, args.kill)
+    if args.command == "restore":
+        return restore_sessions(args.dry_run)
+    if args.command == "find":
+        return find_sessions(" ".join(args.query))
+    if args.command == "_discover":
+        print(json.dumps(discover_wsl_sessions(), ensure_ascii=False))
+        return 0
+    if args.command == "_search":
+        print(json.dumps(search_wsl_sessions(args.query), ensure_ascii=False))
+        return 0
+    return self_test()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
