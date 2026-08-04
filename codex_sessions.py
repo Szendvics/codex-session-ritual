@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Save running WSL Codex sessions and reopen them in Windows Terminal."""
+"""Save running WSL Codex sessions and reopen them in Windows Terminal tabs."""
 
 from __future__ import annotations
 
@@ -257,7 +257,7 @@ def find_sessions(query: str) -> int:
                     print(paint("91", f"Missing WSL directory: {cwd}"))
                     return 1
                 subprocess.Popen(
-                    launch_command(session, wt, wsl),
+                    launch_command([session], wt, wsl),
                     close_fds=True,
                 )
                 print(paint("92", f"Opened: {session['title']}"))
@@ -350,29 +350,34 @@ def load_manifest() -> dict[str, object]:
     return manifest
 
 
-def launch_command(session: dict[str, object], wt: str, wsl: str) -> list[str]:
-    session_id = str(session.get("id", ""))
-    cwd = str(session.get("cwd", ""))
-    if not SESSION_ID.fullmatch(session_id) or not cwd.startswith("/"):
-        raise ValueError(f"Invalid saved session: {session!r}")
-    title = short_title(str(session.get("title") or ""), cwd, session_id)
-    return [
-        wt,
-        "-w",
-        "new",
-        "nt",
-        "--title",
-        title,
-        "--suppressApplicationTitle",
-        wsl,
-        "-d",
-        DISTRO,
-        "--cd",
-        cwd,
-        "bash",
-        "-lic",
-        f"exec codex resume {session_id}",
-    ]
+def launch_command(
+    sessions: list[dict[str, object]], wt: str, wsl: str
+) -> list[str]:
+    command = [wt, "-w", "new"]
+    for session in sessions:
+        session_id = str(session.get("id", ""))
+        cwd = str(session.get("cwd", ""))
+        if not SESSION_ID.fullmatch(session_id) or not cwd.startswith("/"):
+            raise ValueError(f"Invalid saved session: {session!r}")
+        if len(command) > 3:
+            command.append(";")
+        command.extend(
+            [
+                "nt",
+                "--title",
+                short_title(str(session.get("title") or ""), cwd, session_id),
+                "--suppressApplicationTitle",
+                wsl,
+                "-d",
+                DISTRO,
+                "--cd",
+                cwd,
+                "bash",
+                "-lic",
+                f"exec codex resume {session_id}",
+            ]
+        )
+    return command
 
 
 def wsl_directory_exists(wsl: str, cwd: str) -> bool:
@@ -398,6 +403,7 @@ def restore_sessions(dry_run: bool) -> int:
     if codex_check.returncode:
         raise SystemExit(f"Required dependency missing: codex in the {DISTRO} login shell")
     running = {str(session["id"]) for session in discover_from_windows()}
+    pending: list[dict[str, object]] = []
     launched = 0
     action = "Would restore" if dry_run else "Restoring"
     print(paint("1", f"{action} {len(manifest['sessions'])} saved session(s)"))
@@ -411,7 +417,6 @@ def restore_sessions(dry_run: bool) -> int:
                 f"{paint('96', 'already running')}  {paint('95', session_id)}",
             )
             continue
-        command = launch_command(session, wt, wsl)
         cwd = str(session["cwd"])
         if not wsl_directory_exists(wsl, cwd):
             print_session_card(
@@ -423,10 +428,13 @@ def restore_sessions(dry_run: bool) -> int:
         if dry_run:
             status = paint("93", "would restore")
         else:
-            subprocess.Popen(command, close_fds=True)
+            pending.append(session)
             status = paint("92", "restored")
         print_session_card(index, session, f"{status}  {paint('95', session_id)}")
         launched += 1
+
+    if pending:
+        subprocess.Popen(launch_command(pending, wt, wsl), close_fds=True)
 
     summary = "Would restore" if dry_run else "Restored"
     print(paint("1", f"\n{summary} {launched} session(s)."))
@@ -437,11 +445,14 @@ def self_test() -> int:
     session_id = "01234567-89ab-cdef-0123-456789abcdef"
     assert short_title("  a   useful title ", "/tmp/work", session_id) == "a useful title"
     assert short_title(None, "/tmp/work", session_id) == "work"
+    session = {"id": session_id, "cwd": "/tmp/a b", "title": "test"}
     command = launch_command(
-        {"id": session_id, "cwd": "/tmp/a b", "title": "test"},
+        [session, session],
         "wt.exe",
         "wsl.exe",
     )
+    assert command[:4] == ["wt.exe", "-w", "new", "nt"]
+    assert command.count(";") == 1
     assert command[-4:] == ["/tmp/a b", "bash", "-lic", f"exec codex resume {session_id}"]
     line = json.dumps(
         {"type": "event_msg", "payload": {"type": "user_message", "message": "task42 ready"}},

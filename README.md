@@ -1,8 +1,8 @@
 # Codex session ritual
 
 Save all running interactive Codex CLI sessions from Ubuntu WSL, then restore
-each one into its own Windows Terminal window with its saved directory, title,
-and exact session ID.
+them as tabs in one Windows Terminal window with their saved directories,
+titles, and exact session IDs.
 
 Fixed requirements:
 
@@ -31,7 +31,7 @@ $env:CODEX_SESSIONS_WSL_PYTHON = "/usr/bin/python3"
 ```powershell
 saveSessions                # save every running interactive WSL Codex session
 saveSessions --kill         # save, then send SIGTERM to the found Codex processes
-restoreSessions             # reopen each saved session in its own Terminal window
+restoreSessions             # reopen saved sessions as tabs in one Terminal window
 findSessions "topic words"        # suggest matching sessions from conversation history
 saveSessions --dry-run      # inspect without replacing the save
 restoreSessions --dry-run   # inspect without opening windows
