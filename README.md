@@ -31,7 +31,7 @@ $env:CODEX_SESSIONS_WSL_PYTHON = "/usr/bin/python3"
 ```powershell
 saveSessions                # save every running interactive WSL Codex session
 saveSessions --kill         # save, then send SIGTERM to the found Codex processes
-restoreSessions             # reopen saved sessions as tabs in one Terminal window
+restoreSessions             # reopen tabs, then autosave every minute until Ctrl+C
 findSessions "topic words"        # suggest matching sessions from conversation history
 saveSessions --dry-run      # inspect without replacing the save
 restoreSessions --dry-run   # inspect without opening windows
@@ -39,6 +39,10 @@ restoreSessions --dry-run   # inspect without opening windows
 
 Plain `saveSessions` never stops anything. `--kill` saves first, then sends
 `SIGTERM`; it may interrupt an active turn.
+
+`restoreSessions` stays open after launching and merges running sessions into
+the save every minute. Missing sessions are kept so an accidentally closed tab
+remains restorable. Press `Ctrl+C` to stop autosave without closing sessions.
 
 All three commands print numbered, colored session cards. `findSessions`
 searches user and assistant messages only, shows a matching excerpt, and lets

@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,6 +26,7 @@ TOKENS = re.compile(r"[^\W\d_]+|\d+")
 STATE_VERSION = 1
 DISTRO = os.environ.get("CODEX_SESSIONS_DISTRO", "Ubuntu")
 WSL_PYTHON = os.environ.get("CODEX_SESSIONS_WSL_PYTHON", "/usr/bin/python3")
+AUTOSAVE_INTERVAL_SECONDS = 60
 
 
 def short_title(value: str | None, cwd: str, session_id: str) -> str:
@@ -287,6 +289,23 @@ def state_file() -> Path:
     return Path(__file__).resolve().with_name("sessions.json")
 
 
+def write_manifest(sessions: list[dict[str, object]]) -> None:
+    manifest = {
+        "version": STATE_VERSION,
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "sessions": sessions,
+    }
+    destination = state_file()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=destination.parent, delete=False
+    ) as stream:
+        json.dump(manifest, stream, ensure_ascii=False, indent=2)
+        stream.write("\n")
+        temporary = Path(stream.name)
+    temporary.replace(destination)
+
+
 def save_sessions(dry_run: bool, kill: bool) -> int:
     live_sessions = discover_from_windows() if os.name == "nt" else discover_wsl_sessions()
     if not live_sessions:
@@ -300,21 +319,8 @@ def save_sessions(dry_run: bool, kill: bool) -> int:
         for session in live_sessions
     ]
 
-    manifest = {
-        "version": STATE_VERSION,
-        "saved_at": datetime.now(timezone.utc).isoformat(),
-        "sessions": sessions,
-    }
     if not dry_run:
-        destination = state_file()
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            "w", encoding="utf-8", dir=destination.parent, delete=False
-        ) as stream:
-            json.dump(manifest, stream, ensure_ascii=False, indent=2)
-            stream.write("\n")
-            temporary = Path(stream.name)
-        temporary.replace(destination)
+        write_manifest(sessions)
 
     action = "Would save" if dry_run else "Saved"
     status = paint("93" if dry_run else "92", action.lower())
@@ -348,6 +354,35 @@ def load_manifest() -> dict[str, object]:
     if manifest.get("version") != STATE_VERSION or not isinstance(manifest.get("sessions"), list):
         raise SystemExit(f"Unsupported or invalid save file: {state_file()}")
     return manifest
+
+
+def merge_sessions(
+    saved_sessions: list[dict[str, object]],
+    live_sessions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    merged = {str(session["id"]): session for session in saved_sessions}
+    for session in live_sessions:
+        snapshot = {key: session[key] for key in ("id", "cwd", "title")}
+        merged[str(snapshot["id"])] = snapshot
+    return list(merged.values())
+
+
+def watch_sessions() -> None:
+    print(paint("96", "\nAutosave active every 60 seconds; press Ctrl+C to stop."))
+    try:
+        while True:
+            live_sessions = discover_from_windows()
+            if live_sessions:
+                sessions = merge_sessions(load_manifest()["sessions"], live_sessions)
+                write_manifest(sessions)
+                status = f"Autosaved {len(sessions)} session(s)"
+            else:
+                status = "No running sessions; saved snapshot kept"
+            timestamp = datetime.now().astimezone().strftime("%H:%M:%S")
+            print(f"\r{paint('92', status)} at {timestamp}  ", end="", flush=True)
+            time.sleep(AUTOSAVE_INTERVAL_SECONDS)
+    except KeyboardInterrupt:
+        print(paint("93", "\nAutosave stopped."))
 
 
 def launch_command(
@@ -438,7 +473,10 @@ def restore_sessions(dry_run: bool) -> int:
 
     summary = "Would restore" if dry_run else "Restored"
     print(paint("1", f"\n{summary} {launched} session(s)."))
-    return 0 if launched or running else 1
+    result = 0 if launched or running else 1
+    if not dry_run and result == 0:
+        watch_sessions()
+    return result
 
 
 def self_test() -> int:
@@ -454,6 +492,14 @@ def self_test() -> int:
     assert command[:4] == ["wt.exe", "-w", "new", "nt"]
     assert command.count(";") == 1
     assert command[-4:] == ["/tmp/a b", "bash", "-lic", f"exec codex resume {session_id}"]
+    other = {
+        "id": "fedcba98-7654-3210-fedc-ba9876543210",
+        "cwd": "/tmp/other",
+        "title": "other",
+    }
+    merged = merge_sessions([session], [other])
+    assert [item["id"] for item in merged] == [session_id, other["id"]]
+    assert merge_sessions(merged, []) == merged
     line = json.dumps(
         {"type": "event_msg", "payload": {"type": "user_message", "message": "task42 ready"}},
         separators=(",", ":"),
