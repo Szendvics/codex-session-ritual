@@ -71,7 +71,11 @@ def session_from_rollout(path: Path, pid: int | None = None) -> dict[str, object
         cwd = payload["cwd"]
     except (OSError, StopIteration, KeyError, TypeError, json.JSONDecodeError):
         return None
-    if not SESSION_ID.fullmatch(session_id) or not isinstance(cwd, str):
+    if (
+        payload.get("source") != "cli"
+        or not SESSION_ID.fullmatch(session_id)
+        or not isinstance(cwd, str)
+    ):
         return None
     session: dict[str, object] = {"id": session_id, "cwd": cwd}
     if pid is not None:
@@ -483,6 +487,14 @@ def self_test() -> int:
     session_id = "01234567-89ab-cdef-0123-456789abcdef"
     assert short_title("  a   useful title ", "/tmp/work", session_id) == "a useful title"
     assert short_title(None, "/tmp/work", session_id) == "work"
+    with tempfile.TemporaryDirectory() as directory:
+        rollout = Path(directory) / "rollout.jsonl"
+        metadata = {"payload": {"id": session_id, "cwd": "/tmp/work", "source": "cli"}}
+        rollout.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
+        assert session_from_rollout(rollout) is not None
+        metadata["payload"]["source"] = {"subagent": {}}
+        rollout.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
+        assert session_from_rollout(rollout) is None
     session = {"id": session_id, "cwd": "/tmp/a b", "title": "test"}
     command = launch_command(
         [session, session],
