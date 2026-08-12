@@ -6,7 +6,7 @@ titles, and exact session IDs.
 
 Fixed requirements:
 
-- Windows PowerShell 5.1 with Python 3.13 and `py.exe`
+- Windows PowerShell 5.1 or PowerShell 7 with Python 3.13 and `py.exe`
 - `wt.exe` and `wsl.exe` on the Windows `PATH`
 - a WSL distribution named `Ubuntu`
 - Ubuntu system Python at `/usr/bin/python3`
@@ -20,6 +20,11 @@ cd codex-session-ritual
 .\install.ps1
 . $PROFILE
 ```
+
+The installer registers the commands in both the PowerShell 7 and Windows
+PowerShell 5.1 user profiles, regardless of which shell runs the installer.
+Clone into a Windows directory: `RemoteSigned` correctly blocks an unsigned
+installer launched directly from a `\\wsl.localhost\...` path.
 
 The defaults can be changed without editing the program:
 

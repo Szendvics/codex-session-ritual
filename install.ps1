@@ -12,12 +12,22 @@ Copy-Item -Path @(
     "$PSScriptRoot\README.md"
 ) -Destination $installDirectory -Force
 
-$profileDirectory = Split-Path -Parent $PROFILE
-New-Item -ItemType Directory -Force $profileDirectory | Out-Null
-if (-not (Test-Path $PROFILE)) { New-Item -ItemType File $PROFILE | Out-Null }
-if (-not (Select-String -Path $PROFILE -SimpleMatch $profileImport -Quiet)) {
-    Add-Content -Path $PROFILE -Value "`n$profileImport"
+$documents = [Environment]::GetFolderPath("MyDocuments")
+$profilePaths = @(
+    $PROFILE
+    (Join-Path $documents "PowerShell\Microsoft.PowerShell_profile.ps1")
+    (Join-Path $documents "WindowsPowerShell\Microsoft.PowerShell_profile.ps1")
+) | Select-Object -Unique
+
+foreach ($profilePath in $profilePaths) {
+    New-Item -ItemType Directory -Force (Split-Path -Parent $profilePath) | Out-Null
+    if (-not (Test-Path $profilePath)) { New-Item -ItemType File $profilePath | Out-Null }
+    if (-not (Select-String -Path $profilePath -SimpleMatch $profileImport -Quiet)) {
+        Add-Content -Path $profilePath -Value "`n$profileImport"
+    }
 }
 
 & $venvPython (Join-Path $installDirectory "codex_sessions.py") self-test
-Write-Host "Installed. Reload with: . `$PROFILE"
+Write-Host "Installed for:"
+$profilePaths | ForEach-Object { Write-Host "  $_" }
+Write-Host "Reload with: . `$PROFILE"
