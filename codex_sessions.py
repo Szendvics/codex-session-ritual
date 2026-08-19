@@ -83,7 +83,17 @@ def session_from_rollout(path: Path, pid: int | None = None) -> dict[str, object
     return session
 
 
-def thread_labels(codex_home: Path, session_ids: list[str]) -> dict[str, str]:
+def is_yolo(approval_mode: str, sandbox_policy: str) -> bool:
+    try:
+        sandbox_type = json.loads(sandbox_policy).get("type")
+    except (AttributeError, TypeError, json.JSONDecodeError):
+        return False
+    return approval_mode == "never" and sandbox_type in {"disabled", "danger-full-access"}
+
+
+def thread_metadata(
+    codex_home: Path, session_ids: list[str]
+) -> dict[str, tuple[str | None, bool]]:
     if not session_ids:
         return {}
     placeholders = ",".join("?" for _ in session_ids)
@@ -91,11 +101,15 @@ def thread_labels(codex_home: Path, session_ids: list[str]) -> dict[str, str]:
     try:
         with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
             rows = connection.execute(
-                f"SELECT id, COALESCE(NULLIF(name, ''), title) FROM threads "
+                f"SELECT id, COALESCE(NULLIF(name, ''), title), approval_mode, sandbox_policy "
+                f"FROM threads "
                 f"WHERE id IN ({placeholders})",
                 session_ids,
             )
-        return {session_id: label for session_id, label in rows if label}
+        metadata = {}
+        for session_id, label, approval_mode, sandbox_policy in rows:
+            metadata[session_id] = (label, is_yolo(approval_mode, sandbox_policy))
+        return metadata
     except sqlite3.Error:
         return {}
 
@@ -126,9 +140,10 @@ def discover_wsl_sessions() -> list[dict[str, object]]:
             if session:
                 found[str(session["id"])] = session
 
-    labels = thread_labels(codex_home, list(found))
+    metadata = thread_metadata(codex_home, list(found))
     for session_id, session in found.items():
-        session["title"] = short_title(labels.get(session_id), str(session["cwd"]), session_id)
+        label, session["yolo"] = metadata.get(session_id, (None, False))
+        session["title"] = short_title(label, str(session["cwd"]), session_id)
     return sorted(found.values(), key=lambda session: (str(session["title"]).lower(), str(session["id"])))
 
 
@@ -219,10 +234,11 @@ def search_wsl_sessions(query: str) -> list[dict[str, object]]:
             session["context"] = best_context
             matches.append(session)
 
-    labels = thread_labels(Path.home() / ".codex", [str(item["id"]) for item in matches])
+    metadata = thread_metadata(Path.home() / ".codex", [str(item["id"]) for item in matches])
     for session in matches:
         session_id = str(session["id"])
-        session["title"] = short_title(labels.get(session_id), str(session["cwd"]), session_id)
+        label, session["yolo"] = metadata.get(session_id, (None, False))
+        session["title"] = short_title(label, str(session["cwd"]), session_id)
     return sorted(
         matches,
         key=lambda item: (int(item["score"]), str(item["date"])),
@@ -310,6 +326,18 @@ def write_manifest(sessions: list[dict[str, object]]) -> None:
     temporary.replace(destination)
 
 
+def snapshot_sessions(live_sessions: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [
+        {
+            "id": session["id"],
+            "cwd": session["cwd"],
+            "title": session["title"],
+            "yolo": bool(session.get("yolo")),
+        }
+        for session in live_sessions
+    ]
+
+
 def save_sessions(dry_run: bool, kill: bool) -> int:
     live_sessions = discover_from_windows() if os.name == "nt" else discover_wsl_sessions()
     if not live_sessions:
@@ -318,10 +346,7 @@ def save_sessions(dry_run: bool, kill: bool) -> int:
             file=sys.stderr,
         )
         return 1
-    sessions = [
-        {key: session[key] for key in ("id", "cwd", "title")}
-        for session in live_sessions
-    ]
+    sessions = snapshot_sessions(live_sessions)
 
     if not dry_run:
         write_manifest(sessions)
@@ -360,24 +385,13 @@ def load_manifest() -> dict[str, object]:
     return manifest
 
 
-def merge_sessions(
-    saved_sessions: list[dict[str, object]],
-    live_sessions: list[dict[str, object]],
-) -> list[dict[str, object]]:
-    merged = {str(session["id"]): session for session in saved_sessions}
-    for session in live_sessions:
-        snapshot = {key: session[key] for key in ("id", "cwd", "title")}
-        merged[str(snapshot["id"])] = snapshot
-    return list(merged.values())
-
-
 def watch_sessions() -> None:
     print(paint("96", "\nAutosave active every 60 seconds; press Ctrl+C to stop."))
     try:
         while True:
             live_sessions = discover_from_windows()
             if live_sessions:
-                sessions = merge_sessions(load_manifest()["sessions"], live_sessions)
+                sessions = snapshot_sessions(live_sessions)
                 write_manifest(sessions)
                 status = f"Autosaved {len(sessions)} session(s)"
             else:
@@ -400,6 +414,11 @@ def launch_command(
             raise ValueError(f"Invalid saved session: {session!r}")
         if len(command) > 3:
             command.append(";")
+        resume_command = f"codex {'--yolo ' if session.get('yolo') else ''}resume {session_id}"
+        shell_command = (
+            f"history -s '{resume_command}'; history -a; "
+            f"{resume_command}; exec bash -l"
+        )
         command.extend(
             [
                 "nt",
@@ -413,7 +432,7 @@ def launch_command(
                 cwd,
                 "bash",
                 "-lic",
-                f"exec codex resume {session_id}",
+                shell_command,
             ]
         )
     return command
@@ -487,6 +506,8 @@ def self_test() -> int:
     session_id = "01234567-89ab-cdef-0123-456789abcdef"
     assert short_title("  a   useful title ", "/tmp/work", session_id) == "a useful title"
     assert short_title(None, "/tmp/work", session_id) == "work"
+    assert is_yolo("never", '{"type":"disabled"}')
+    assert not is_yolo("on-request", '{"type":"disabled"}')
     with tempfile.TemporaryDirectory() as directory:
         rollout = Path(directory) / "rollout.jsonl"
         metadata = {"payload": {"id": session_id, "cwd": "/tmp/work", "source": "cli"}}
@@ -495,7 +516,7 @@ def self_test() -> int:
         metadata["payload"]["source"] = {"subagent": {}}
         rollout.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
         assert session_from_rollout(rollout) is None
-    session = {"id": session_id, "cwd": "/tmp/a b", "title": "test"}
+    session = {"id": session_id, "cwd": "/tmp/a b", "title": "test", "yolo": False}
     command = launch_command(
         [session, session],
         "wt.exe",
@@ -503,15 +524,21 @@ def self_test() -> int:
     )
     assert command[:4] == ["wt.exe", "-w", "new", "nt"]
     assert command.count(";") == 1
-    assert command[-4:] == ["/tmp/a b", "bash", "-lic", f"exec codex resume {session_id}"]
+    assert command[-4:] == [
+        "/tmp/a b",
+        "bash",
+        "-lic",
+        f"history -s 'codex resume {session_id}'; history -a; "
+        f"codex resume {session_id}; exec bash -l",
+    ]
     other = {
         "id": "fedcba98-7654-3210-fedc-ba9876543210",
         "cwd": "/tmp/other",
         "title": "other",
     }
-    merged = merge_sessions([session], [other])
-    assert [item["id"] for item in merged] == [session_id, other["id"]]
-    assert merge_sessions(merged, []) == merged
+    assert [item["id"] for item in snapshot_sessions([other])] == [other["id"]]
+    yolo_command = launch_command([{**session, "yolo": True}], "wt.exe", "wsl.exe")[-1]
+    assert f"codex --yolo resume {session_id}" in yolo_command
     line = json.dumps(
         {"type": "event_msg", "payload": {"type": "user_message", "message": "task42 ready"}},
         separators=(",", ":"),

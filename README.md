@@ -2,7 +2,7 @@
 
 Save all running interactive Codex CLI sessions from Ubuntu WSL, then restore
 them as tabs in one Windows Terminal window with their saved directories,
-titles, and exact session IDs.
+titles, exact session IDs, and YOLO mode when it was active.
 
 Fixed requirements:
 
@@ -45,9 +45,13 @@ restoreSessions --dry-run   # inspect without opening windows
 Plain `saveSessions` never stops anything. `--kill` saves first, then sends
 `SIGTERM`; it may interrupt an active turn.
 
-`restoreSessions` stays open after launching and merges running sessions into
-the save every minute. Missing sessions are kept so an accidentally closed tab
-remains restorable. Press `Ctrl+C` to stop autosave without closing sessions.
+`restoreSessions` stays open after launching and saves the exact running session
+list every minute, so opened and closed sessions are tracked. If every session
+is closed, the last non-empty snapshot is kept. Press `Ctrl+C` to stop autosave
+without closing sessions.
+
+After Codex exits, its WSL tab stays open. The exact resume command is saved in
+Bash history, so Up then Enter restarts the session in the same mode.
 
 All three commands print numbered, colored session cards. `findSessions`
 searches user and assistant messages only, shows a matching excerpt, and lets
