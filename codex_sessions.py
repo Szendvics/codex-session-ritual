@@ -416,8 +416,8 @@ def launch_command(
             command.append(";")
         resume_command = f"codex {'--yolo ' if session.get('yolo') else ''}resume {session_id}"
         shell_command = (
-            f"history -s '{resume_command}'; history -a; "
-            f"{resume_command}; exec bash -l"
+            f"history -s '{resume_command}' && history -a && "
+            f"{resume_command} || true && exec bash -l"
         )
         command.extend(
             [
@@ -528,9 +528,10 @@ def self_test() -> int:
         "/tmp/a b",
         "bash",
         "-lic",
-        f"history -s 'codex resume {session_id}'; history -a; "
-        f"codex resume {session_id}; exec bash -l",
+        f"history -s 'codex resume {session_id}' && history -a && "
+        f"codex resume {session_id} || true && exec bash -l",
     ]
+    assert ";" not in command[-1]
     other = {
         "id": "fedcba98-7654-3210-fedc-ba9876543210",
         "cwd": "/tmp/other",
