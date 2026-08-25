@@ -9,8 +9,7 @@ $powerShellExecutables = @(
     (Get-Command pwsh.exe -ErrorAction SilentlyContinue).Source
 ) | Where-Object { $_ } | Select-Object -Unique
 
-foreach ($powerShellExecutable in $powerShellExecutables) {
-    & $powerShellExecutable -NoProfile -NonInteractive -Command @'
+$policyScript = @'
 $policy = Get-ExecutionPolicy
 if ($policy -eq "Restricted") {
     Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force
@@ -21,6 +20,11 @@ if (@("RemoteSigned", "Unrestricted", "Bypass") -notcontains $policy) {
     exit 1
 }
 '@
+$policyBytes = [Text.Encoding]::Unicode.GetBytes($policyScript)
+$encodedPolicyScript = [Convert]::ToBase64String($policyBytes)
+
+foreach ($powerShellExecutable in $powerShellExecutables) {
+    & $powerShellExecutable -NoProfile -NonInteractive -EncodedCommand $encodedPolicyScript
     if ($LASTEXITCODE) { throw "Could not enable profiles for $powerShellExecutable" }
 }
 
