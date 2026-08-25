@@ -23,6 +23,9 @@ cd codex-session-ritual
 
 The installer registers the commands in both the PowerShell 7 and Windows
 PowerShell 5.1 user profiles, regardless of which shell runs the installer.
+It changes the per-user execution policy from the Windows default `Restricted`
+to `RemoteSigned` where required, so those profiles load on future shell starts.
+It does not override stricter explicit or organization policies.
 Clone into a Windows directory: `RemoteSigned` correctly blocks an unsigned
 installer launched directly from a `\\wsl.localhost\...` path.
 

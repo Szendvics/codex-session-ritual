@@ -27,6 +27,7 @@ STATE_VERSION = 1
 DISTRO = os.environ.get("CODEX_SESSIONS_DISTRO", "Ubuntu")
 WSL_PYTHON = os.environ.get("CODEX_SESSIONS_WSL_PYTHON", "/usr/bin/python3")
 AUTOSAVE_INTERVAL_SECONDS = 60
+WSL_TIMEOUT_SECONDS = 30
 
 
 def short_title(value: str | None, cwd: str, session_id: str) -> str:
@@ -154,18 +155,37 @@ def windows_command(name: str) -> str:
     return command
 
 
+def run_wsl_command(
+    wsl: str, *arguments: str, **options: object
+) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            [wsl, "-d", DISTRO, "--", *arguments],
+            timeout=WSL_TIMEOUT_SECONDS,
+            **options,
+        )
+    except subprocess.TimeoutExpired:
+        raise SystemExit(f"Timed out waiting for {DISTRO} WSL.") from None
+
+
 def run_in_wsl(*arguments: str) -> str:
     wsl = windows_command("wsl.exe")
-    python_check = subprocess.run(
-        [wsl, "-d", DISTRO, "--", "test", "-x", WSL_PYTHON],
+    python_check = run_wsl_command(
+        wsl,
+        "test",
+        "-x",
+        WSL_PYTHON,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
     if python_check.returncode:
         raise SystemExit(f"Required dependency missing: {DISTRO} WSL with {WSL_PYTHON}")
     script = Path(__file__).read_text(encoding="utf-8")
-    result = subprocess.run(
-        [wsl, "-d", DISTRO, "--", WSL_PYTHON, "-", *arguments],
+    result = run_wsl_command(
+        wsl,
+        WSL_PYTHON,
+        "-",
+        *arguments,
         check=True,
         capture_output=True,
         encoding="utf-8",
@@ -293,8 +313,11 @@ def find_sessions(query: str) -> int:
 def terminate_sessions(sessions: list[dict[str, object]]) -> None:
     pids = [int(session["pid"]) for session in sessions]
     if os.name == "nt":
-        subprocess.run(
-            [windows_command("wsl.exe"), "-d", DISTRO, "--", "/bin/kill", "-TERM", *map(str, pids)],
+        run_wsl_command(
+            windows_command("wsl.exe"),
+            "/bin/kill",
+            "-TERM",
+            *map(str, pids),
             check=False,
         )
     else:
@@ -375,13 +398,16 @@ def save_sessions(dry_run: bool, kill: bool) -> int:
     return 0
 
 
-def load_manifest() -> dict[str, object]:
+def load_manifest(path: Path | None = None) -> dict[str, object]:
+    path = path or state_file()
     try:
-        manifest = json.loads(state_file().read_text(encoding="utf-8"))
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise SystemExit("No saved sessions found. Run saveSessions first.") from None
     except (OSError, json.JSONDecodeError) as error:
-        raise SystemExit(f"Cannot read {state_file()}: {error}") from error
+        raise SystemExit(f"Cannot read {path}: {error}") from error
     if manifest.get("version") != STATE_VERSION or not isinstance(manifest.get("sessions"), list):
-        raise SystemExit(f"Unsupported or invalid save file: {state_file()}")
+        raise SystemExit(f"Unsupported or invalid save file: {path}")
     return manifest
 
 
@@ -431,7 +457,7 @@ def launch_command(
                 "--cd",
                 cwd,
                 "bash",
-                "-lic",
+                "-lc",
                 shell_command,
             ]
         )
@@ -439,8 +465,11 @@ def launch_command(
 
 
 def wsl_directory_exists(wsl: str, cwd: str) -> bool:
-    return subprocess.run(
-        [wsl, "-d", DISTRO, "--", "test", "-d", cwd],
+    return run_wsl_command(
+        wsl,
+        "test",
+        "-d",
+        cwd,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     ).returncode == 0
@@ -451,10 +480,15 @@ def restore_sessions(dry_run: bool) -> int:
         raise SystemExit("restoreSessions must run from Windows PowerShell.")
 
     manifest = load_manifest()
+    action = "Would restore" if dry_run else "Restoring"
+    print(paint("1", f"{action} {len(manifest['sessions'])} saved session(s)"))
     wt = windows_command("wt.exe")
     wsl = windows_command("wsl.exe")
-    codex_check = subprocess.run(
-        [wsl, "-d", DISTRO, "--", "bash", "-lic", "command -v codex >/dev/null"],
+    codex_check = run_wsl_command(
+        wsl,
+        "bash",
+        "-lc",
+        "command -v codex >/dev/null",
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -463,8 +497,6 @@ def restore_sessions(dry_run: bool) -> int:
     running = {str(session["id"]) for session in discover_from_windows()}
     pending: list[dict[str, object]] = []
     launched = 0
-    action = "Would restore" if dry_run else "Restoring"
-    print(paint("1", f"{action} {len(manifest['sessions'])} saved session(s)"))
 
     for index, session in enumerate(manifest["sessions"], 1):
         session_id = str(session.get("id", ""))
@@ -516,6 +548,12 @@ def self_test() -> int:
         metadata["payload"]["source"] = {"subagent": {}}
         rollout.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
         assert session_from_rollout(rollout) is None
+        try:
+            load_manifest(Path(directory) / "sessions.json")
+        except SystemExit as error:
+            assert str(error) == "No saved sessions found. Run saveSessions first."
+        else:
+            raise AssertionError("Missing manifest should fail clearly")
     session = {"id": session_id, "cwd": "/tmp/a b", "title": "test", "yolo": False}
     command = launch_command(
         [session, session],
@@ -527,7 +565,7 @@ def self_test() -> int:
     assert command[-4:] == [
         "/tmp/a b",
         "bash",
-        "-lic",
+        "-lc",
         f"history -s 'codex resume {session_id}' && history -a && "
         f"codex resume {session_id} || true && exec bash -l",
     ]
