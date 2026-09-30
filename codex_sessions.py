@@ -73,7 +73,7 @@ def session_from_rollout(path: Path, pid: int | None = None) -> dict[str, object
     except (OSError, StopIteration, KeyError, TypeError, json.JSONDecodeError):
         return None
     if (
-        payload.get("source") != "cli"
+        payload.get("source") != "cli" and payload.get("originator") != "codex-tui"
         or not SESSION_ID.fullmatch(session_id)
         or not isinstance(cwd, str)
     ):
@@ -124,7 +124,7 @@ def discover_wsl_sessions() -> list[dict[str, object]]:
         if not process.name.isdigit():
             continue
         try:
-            if Path(os.readlink(process / "exe")).name != "codex":
+            if Path(os.readlink(process / "exe")).name.removesuffix(" (deleted)") != "codex":
                 continue
             descriptors = (process / "fd").iterdir()
         except (OSError, PermissionError):
@@ -549,6 +549,9 @@ def self_test() -> int:
         metadata["payload"]["source"] = {"subagent": {}}
         rollout.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
         assert session_from_rollout(rollout) is None
+        metadata["payload"].update(source="vscode", originator="codex-tui")
+        rollout.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
+        assert session_from_rollout(rollout) is not None
         try:
             load_manifest(Path(directory) / "sessions.json")
         except SystemExit as error:
