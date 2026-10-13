@@ -115,21 +115,72 @@ def thread_metadata(
         return {}
 
 
+def thread_rollouts(codex_home: Path) -> dict[str, tuple[Path, str]]:
+    try:
+        with sqlite3.connect(
+            f"file:{codex_home / 'state_5.sqlite'}?mode=ro", uri=True
+        ) as connection:
+            rows = connection.execute(
+                "SELECT id, rollout_path, cwd FROM threads WHERE archived = 0"
+            )
+            return {
+                session_id: (Path(rollout_path), cwd)
+                for session_id, rollout_path, cwd in rows
+                if isinstance(session_id, str)
+                and SESSION_ID.fullmatch(session_id)
+                and isinstance(rollout_path, str)
+                and isinstance(cwd, str)
+            }
+    except sqlite3.Error:
+        return {}
+
+
+def nearest_session_snapshot(
+    cwd: str,
+    started_at: float,
+    snapshots: list[tuple[float, str]],
+    thread_cwds: dict[str, str],
+    found: set[str],
+) -> str | None:
+    matches = []
+    for timestamp, session_id in snapshots:
+        try:
+            same_cwd = os.path.samefile(thread_cwds.get(session_id, ""), cwd)
+        except OSError:
+            same_cwd = thread_cwds.get(session_id) == cwd
+        if same_cwd and session_id not in found and timestamp >= started_at - 30:
+            matches.append((timestamp, session_id))
+    return min(matches)[1] if matches else None
+
+
 def discover_wsl_sessions() -> list[dict[str, object]]:
     codex_home = Path.home() / ".codex"
     sessions_root = str(codex_home / "sessions") + os.sep
+    rollouts = thread_rollouts(codex_home)
     found: dict[str, dict[str, object]] = {}
+    unresolved: list[tuple[float, str, int]] = []
+    booted_at = time.time() - float(Path("/proc/uptime").read_text().split()[0])
+    clock_ticks = os.sysconf("SC_CLK_TCK")
 
     for process in Path("/proc").iterdir():
         if not process.name.isdigit():
             continue
         try:
-            if Path(os.readlink(process / "exe")).name.removesuffix(" (deleted)") != "codex":
+            executable = Path(os.readlink(process / "exe")).name.removesuffix(" (deleted)")
+            if executable != "codex":
+                continue
+            arguments = (
+                (process / "cmdline").read_bytes().decode(errors="replace").split("\0")
+            )
+            if "app-server" in arguments or not os.readlink(process / "fd" / "0").startswith(
+                "/dev/pts/"
+            ):
                 continue
             descriptors = (process / "fd").iterdir()
         except (OSError, PermissionError):
             continue
 
+        session = None
         for descriptor in descriptors:
             try:
                 target = os.readlink(descriptor)
@@ -140,6 +191,46 @@ def discover_wsl_sessions() -> list[dict[str, object]]:
             session = session_from_rollout(Path(target), int(process.name))
             if session:
                 found[str(session["id"])] = session
+                break
+
+        if session:
+            continue
+        session_id = next((value for value in arguments if SESSION_ID.fullmatch(value)), None)
+        if session_id in rollouts:
+            session = session_from_rollout(rollouts[session_id][0], int(process.name))
+            if session:
+                found[session_id] = session
+                continue
+        try:
+            stat_fields = (process / "stat").read_text().rsplit(")", 1)[1].split()
+            unresolved.append(
+                (
+                    booted_at + int(stat_fields[19]) / clock_ticks,
+                    os.readlink(process / "cwd"),
+                    int(process.name),
+                )
+            )
+        except (OSError, PermissionError, ValueError, IndexError):
+            continue
+
+    snapshots = []
+    for path in (codex_home / "shell_snapshots").glob("*.sh"):
+        session_id = path.name.split(".", 1)[0]
+        if session_id in rollouts:
+            try:
+                snapshots.append((path.stat().st_mtime, session_id))
+            except OSError:
+                pass
+    thread_cwds = {session_id: record[1] for session_id, record in rollouts.items()}
+    for started_at, cwd, pid in sorted(unresolved):
+        # shortcut: bare Codex uses the first matching snapshot, use a server ID if exposed.
+        session_id = nearest_session_snapshot(
+            cwd, started_at, snapshots, thread_cwds, set(found)
+        )
+        if session_id:
+            session = session_from_rollout(rollouts[session_id][0], pid)
+            if session:
+                found[session_id] = session
 
     metadata = thread_metadata(codex_home, list(found))
     for session_id, session in found.items():
@@ -581,6 +672,23 @@ def self_test() -> int:
         "title": "other",
     }
     assert [item["id"] for item in snapshot_sessions([other])] == [other["id"]]
+    snapshots = [(10.0, session_id), (20.0, str(other["id"]))]
+    thread_cwds = {session_id: "/tmp/work", str(other["id"]): "/tmp/work"}
+    assert (
+        nearest_session_snapshot("/tmp/work", 12.0, snapshots, thread_cwds, set())
+        == session_id
+    )
+    assert nearest_session_snapshot(
+        "/tmp/work", 18.0, snapshots, thread_cwds, {session_id}
+    ) == other["id"]
+    assert (
+        nearest_session_snapshot("/tmp/work", 51.0, snapshots, thread_cwds, set())
+        is None
+    )
+    assert (
+        nearest_session_snapshot("/tmp/elsewhere", 5.0, snapshots, thread_cwds, set())
+        is None
+    )
     yolo_command = launch_command([{**session, "yolo": True}], "wt.exe", "wsl.exe")[-1]
     assert f"codex --yolo resume {session_id}" in yolo_command
     line = json.dumps(
