@@ -391,7 +391,7 @@ def find_sessions(query: str) -> int:
                     print(paint("91", f"Missing WSL directory: {cwd}"))
                     return 1
                 subprocess.Popen(
-                    launch_command([session], wt, wsl),
+                    launch_command(session, wt, wsl),
                     close_fds=True,
                 )
                 print(paint("92", f"Opened: {session['title']}"))
@@ -522,39 +522,45 @@ def watch_sessions() -> None:
 
 
 def launch_command(
-    sessions: list[dict[str, object]], wt: str, wsl: str
+    session: dict[str, object], wt: str, wsl: str, window: str = "new"
 ) -> list[str]:
-    command = [wt, "-w", "new"]
-    for session in sessions:
-        session_id = str(session.get("id", ""))
-        cwd = str(session.get("cwd", ""))
-        if not SESSION_ID.fullmatch(session_id) or not cwd.startswith("/"):
-            raise ValueError(f"Invalid saved session: {session!r}")
-        if len(command) > 3:
-            command.append(";")
-        resume_command = f"codex {'--yolo ' if session.get('yolo') else ''}resume {session_id}"
-        shell_command = (
-            f"history -s '{resume_command}' && history -a || true\n"
-            f"{resume_command}\n"
-            f"exec bash -l"
-        )
-        command.extend(
-            [
-                "nt",
-                "--title",
-                short_title(str(session.get("title") or ""), cwd, session_id),
-                "--suppressApplicationTitle",
-                wsl,
-                "-d",
-                DISTRO,
-                "--cd",
-                cwd,
-                "bash",
-                "-lc",
-                shell_command,
-            ]
-        )
-    return command
+    session_id = str(session.get("id", ""))
+    cwd = str(session.get("cwd", ""))
+    if not SESSION_ID.fullmatch(session_id) or not cwd.startswith("/"):
+        raise ValueError(f"Invalid saved session: {session!r}")
+    resume_command = f"codex {'--yolo ' if session.get('yolo') else ''}resume {session_id}"
+    shell_command = (
+        f"history -s '{resume_command}' && history -a || true\n"
+        f"{resume_command}\n"
+        f"exec bash -l"
+    )
+    return [
+        wt,
+        "-w",
+        window,
+        "nt",
+        "--title",
+        short_title(str(session.get("title") or ""), cwd, session_id),
+        "--suppressApplicationTitle",
+        wsl,
+        "-d",
+        DISTRO,
+        "--cd",
+        cwd,
+        "bash",
+        "-lc",
+        shell_command,
+    ]
+
+
+def wait_for_session(session_id: str) -> None:
+    deadline = time.monotonic() + WSL_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        running = {str(session["id"]) for session in discover_from_windows()}
+        if session_id in running:
+            return
+        time.sleep(1)
+    raise SystemExit(f"Timed out waiting for Codex session {session_id} to start.")
 
 
 def wsl_directory_exists(wsl: str, cwd: str) -> bool:
@@ -617,7 +623,12 @@ def restore_sessions(dry_run: bool) -> int:
         launched += 1
 
     if pending:
-        subprocess.Popen(launch_command(pending, wt, wsl), close_fds=True)
+        window = f"codex-sessions-{os.getpid()}-{time.time_ns()}"
+        for session in pending:
+            subprocess.Popen(
+                launch_command(session, wt, wsl, window), close_fds=True
+            )
+            wait_for_session(str(session["id"]))
 
     summary = "Would restore" if dry_run else "Restored"
     print(paint("1", f"\n{summary} {launched} session(s)."))
@@ -628,6 +639,8 @@ def restore_sessions(dry_run: bool) -> int:
 
 
 def self_test() -> int:
+    from unittest import mock
+
     session_id = "01234567-89ab-cdef-0123-456789abcdef"
     assert short_title("  a   useful title ", "/tmp/work", session_id) == "a useful title"
     assert short_title(None, "/tmp/work", session_id) == "work"
@@ -651,13 +664,8 @@ def self_test() -> int:
         else:
             raise AssertionError("Missing manifest should fail clearly")
     session = {"id": session_id, "cwd": "/tmp/a b", "title": "test", "yolo": False}
-    command = launch_command(
-        [session, session],
-        "wt.exe",
-        "wsl.exe",
-    )
+    command = launch_command(session, "wt.exe", "wsl.exe")
     assert command[:4] == ["wt.exe", "-w", "new", "nt"]
-    assert command.count(";") == 1
     assert command[-4:] == [
         "/tmp/a b",
         "bash",
@@ -673,6 +681,26 @@ def self_test() -> int:
         "title": "other",
     }
     assert [item["id"] for item in snapshot_sessions([other])] == [other["id"]]
+    named_command = launch_command(other, "wt.exe", "wsl.exe", "codex-sessions-test")
+    assert named_command[:4] == ["wt.exe", "-w", "codex-sessions-test", "nt"]
+    with mock.patch.object(
+        sys.modules[__name__],
+        "discover_from_windows",
+        side_effect=[[], [{"id": session_id}]],
+    ) as discover, mock.patch.object(time, "sleep"):
+        wait_for_session(session_id)
+        assert discover.call_count == 2
+    with mock.patch.object(
+        sys.modules[__name__], "discover_from_windows", return_value=[]
+    ), mock.patch.object(time, "monotonic", side_effect=[0.0, 0.0, 31.0]), mock.patch.object(
+        time, "sleep"
+    ):
+        try:
+            wait_for_session(session_id)
+        except SystemExit as error:
+            assert str(error) == f"Timed out waiting for Codex session {session_id} to start."
+        else:
+            raise AssertionError("Restore readiness timeout should fail clearly")
     snapshots = [(10.0, session_id), (20.0, str(other["id"]))]
     thread_cwds = {session_id: "/tmp/work", str(other["id"]): "/tmp/work"}
     assert (
@@ -697,7 +725,7 @@ def self_test() -> int:
         nearest_session_snapshot("/tmp/elsewhere", 5.0, snapshots, thread_cwds, set())
         is None
     )
-    yolo_command = launch_command([{**session, "yolo": True}], "wt.exe", "wsl.exe")[-1]
+    yolo_command = launch_command({**session, "yolo": True}, "wt.exe", "wsl.exe")[-1]
     assert f"codex --yolo resume {session_id}" in yolo_command
     line = json.dumps(
         {"type": "event_msg", "payload": {"type": "user_message", "message": "task42 ready"}},
