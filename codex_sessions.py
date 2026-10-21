@@ -155,6 +155,15 @@ def nearest_session_snapshot(
     return min(matches)[2] if matches else None
 
 
+def remember_session(
+    found: dict[str, dict[str, object]], session: dict[str, object]
+) -> None:
+    session_id = str(session["id"])
+    previous = found.get(session_id)
+    if previous is None or int(session["pid"]) > int(previous["pid"]):
+        found[session_id] = session
+
+
 def discover_wsl_sessions() -> list[dict[str, object]]:
     codex_home = Path.home() / ".codex"
     sessions_root = str(codex_home / "sessions") + os.sep
@@ -192,7 +201,7 @@ def discover_wsl_sessions() -> list[dict[str, object]]:
                 continue
             session = session_from_rollout(Path(target), int(process.name))
             if session:
-                found[str(session["id"])] = session
+                remember_session(found, session)
                 break
 
         if session:
@@ -201,7 +210,7 @@ def discover_wsl_sessions() -> list[dict[str, object]]:
         if session_id in rollouts:
             session = session_from_rollout(rollouts[session_id][0], int(process.name))
             if session:
-                found[session_id] = session
+                remember_session(found, session)
                 continue
         try:
             stat_fields = (process / "stat").read_text().rsplit(")", 1)[1].split()
@@ -232,7 +241,7 @@ def discover_wsl_sessions() -> list[dict[str, object]]:
         if session_id:
             session = session_from_rollout(rollouts[session_id][0], pid)
             if session:
-                found[session_id] = session
+                remember_session(found, session)
 
     metadata = thread_metadata(codex_home, list(found))
     for session_id, session in found.items():
@@ -554,11 +563,20 @@ def launch_command(
     ]
 
 
-def wait_for_session(session_id: str) -> None:
+def wait_for_session(session_id: str, previous_pid: int | None = None) -> None:
     deadline = time.monotonic() + WSL_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
-        running = {str(session["id"]) for session in discover_from_windows()}
-        if session_id in running:
+        running = next(
+            (
+                session
+                for session in discover_from_windows()
+                if str(session["id"]) == session_id
+            ),
+            None,
+        )
+        if running is not None and (
+            previous_pid is None or running.get("pid") != previous_pid
+        ):
             time.sleep(RESTORE_SETTLE_SECONDS)
             return
         time.sleep(1)
@@ -595,19 +613,15 @@ def restore_sessions(dry_run: bool) -> int:
     )
     if codex_check.returncode:
         raise SystemExit(f"Required dependency missing: codex in the {DISTRO} login shell")
-    running = {str(session["id"]) for session in discover_from_windows()}
-    pending: list[dict[str, object]] = []
+    running = {
+        str(session["id"]): int(session["pid"])
+        for session in discover_from_windows()
+    }
+    pending: list[tuple[dict[str, object], int | None]] = []
     launched = 0
 
     for index, session in enumerate(manifest["sessions"], 1):
         session_id = str(session.get("id", ""))
-        if session_id in running:
-            print_session_card(
-                index,
-                session,
-                f"{paint('96', 'already running')}  {paint('95', session_id)}",
-            )
-            continue
         cwd = str(session["cwd"])
         if not wsl_directory_exists(wsl, cwd):
             print_session_card(
@@ -617,20 +631,24 @@ def restore_sessions(dry_run: bool) -> int:
             )
             continue
         if dry_run:
-            status = paint("93", "would restore")
+            status = paint(
+                "93", "would reopen" if session_id in running else "would restore"
+            )
         else:
-            pending.append(session)
-            status = paint("92", "restored")
+            pending.append((session, running.get(session_id)))
+            status = paint(
+                "92", "reopened" if session_id in running else "restored"
+            )
         print_session_card(index, session, f"{status}  {paint('95', session_id)}")
         launched += 1
 
     if pending:
         window = f"codex-sessions-{os.getpid()}-{time.time_ns()}"
-        for session in pending:
+        for session, previous_pid in pending:
             subprocess.Popen(
                 launch_command(session, wt, wsl, window), close_fds=True
             )
-            wait_for_session(str(session["id"]))
+            wait_for_session(str(session["id"]), previous_pid)
 
     summary = "Would restore" if dry_run else "Restored"
     print(paint("1", f"\n{summary} {launched} session(s)."))
@@ -683,6 +701,10 @@ def self_test() -> int:
         "title": "other",
     }
     assert [item["id"] for item in snapshot_sessions([other])] == [other["id"]]
+    remembered: dict[str, dict[str, object]] = {}
+    remember_session(remembered, {"id": session_id, "pid": 42})
+    remember_session(remembered, {"id": session_id, "pid": 41})
+    assert remembered[session_id]["pid"] == 42
     named_command = launch_command(other, "wt.exe", "wsl.exe", "codex-sessions-test")
     assert named_command[:4] == ["wt.exe", "-w", "codex-sessions-test", "nt"]
     with mock.patch.object(
@@ -691,6 +713,17 @@ def self_test() -> int:
         side_effect=[[], [{"id": session_id}]],
     ) as discover, mock.patch.object(time, "sleep") as sleep:
         wait_for_session(session_id)
+        assert discover.call_count == 2
+        assert sleep.call_args_list == [mock.call(1), mock.call(RESTORE_SETTLE_SECONDS)]
+    with mock.patch.object(
+        sys.modules[__name__],
+        "discover_from_windows",
+        side_effect=[
+            [{"id": session_id, "pid": 41}],
+            [{"id": session_id, "pid": 42}],
+        ],
+    ) as discover, mock.patch.object(time, "sleep") as sleep:
+        wait_for_session(session_id, 41)
         assert discover.call_count == 2
         assert sleep.call_args_list == [mock.call(1), mock.call(RESTORE_SETTLE_SECONDS)]
     with mock.patch.object(
@@ -704,6 +737,30 @@ def self_test() -> int:
             assert str(error) == f"Timed out waiting for Codex session {session_id} to start."
         else:
             raise AssertionError("Restore readiness timeout should fail clearly")
+    module = sys.modules[__name__]
+    with mock.patch.object(os, "name", "nt"), mock.patch.object(
+        module,
+        "load_manifest",
+        return_value={"sessions": [session]},
+    ), mock.patch.object(module, "windows_command", return_value="command.exe"), mock.patch.object(
+        module,
+        "run_wsl_command",
+        return_value=mock.Mock(returncode=0),
+    ), mock.patch.object(
+        module,
+        "discover_from_windows",
+        return_value=[{"id": session_id, "pid": 41}],
+    ), mock.patch.object(module, "wsl_directory_exists", return_value=True), mock.patch.object(
+        module, "launch_command", return_value=["wt.exe"]
+    ), mock.patch.object(subprocess, "Popen") as popen, mock.patch.object(
+        module, "wait_for_session"
+    ) as wait, mock.patch.object(module, "watch_sessions") as watch, mock.patch(
+        "builtins.print"
+    ):
+        assert restore_sessions(False) == 0
+        popen.assert_called_once()
+        wait.assert_called_once_with(session_id, 41)
+        watch.assert_called_once()
     snapshots = [(10.0, session_id), (20.0, str(other["id"]))]
     thread_cwds = {session_id: "/tmp/work", str(other["id"]): "/tmp/work"}
     assert (
