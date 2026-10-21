@@ -148,9 +148,10 @@ def nearest_session_snapshot(
             same_cwd = os.path.samefile(thread_cwds.get(session_id, ""), cwd)
         except OSError:
             same_cwd = thread_cwds.get(session_id) == cwd
-        if same_cwd and session_id not in found and timestamp >= started_at - 30:
-            matches.append((timestamp, session_id))
-    return min(matches)[1] if matches else None
+        distance = abs(timestamp - started_at)
+        if same_cwd and session_id not in found and distance <= 30:
+            matches.append((distance, timestamp, session_id))
+    return min(matches)[2] if matches else None
 
 
 def discover_wsl_sessions() -> list[dict[str, object]]:
@@ -223,7 +224,7 @@ def discover_wsl_sessions() -> list[dict[str, object]]:
                 pass
     thread_cwds = {session_id: record[1] for session_id, record in rollouts.items()}
     for started_at, cwd, pid in sorted(unresolved):
-        # shortcut: bare Codex uses the first matching snapshot, use a server ID if exposed.
+        # shortcut: Codex uses the nearest snapshot, use a server ID if exposed.
         session_id = nearest_session_snapshot(
             cwd, started_at, snapshots, thread_cwds, set(found)
         )
@@ -677,6 +678,13 @@ def self_test() -> int:
     assert (
         nearest_session_snapshot("/tmp/work", 12.0, snapshots, thread_cwds, set())
         == session_id
+    )
+    nearby_snapshots = [(10.0, session_id), (13.0, str(other["id"]))]
+    assert (
+        nearest_session_snapshot(
+            "/tmp/work", 12.0, nearby_snapshots, thread_cwds, set()
+        )
+        == other["id"]
     )
     assert nearest_session_snapshot(
         "/tmp/work", 18.0, snapshots, thread_cwds, {session_id}
