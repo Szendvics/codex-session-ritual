@@ -53,6 +53,13 @@ list every minute, so opened and closed sessions are tracked. If every session
 is closed, the last non-empty snapshot is kept. Press `Ctrl+C` to stop autosave
 without closing sessions.
 
+Discovery also checks recent Codex resume events when reconnecting does not
+create a shell snapshot. Identified processes are cached locally in
+`~/.codex/session-ritual-processes.json`, including during discovery dry-runs;
+the boot ID and process start time prevent reusing stale PIDs. If an interactive
+process cannot be identified, saving stops and keeps the previous snapshot.
+Resuming with an explicit session ID avoids this timestamp-based fallback.
+
 After Codex exits, its WSL tab stays open. The exact resume command is saved in
 Bash history, so Up then Enter restarts the session in the same mode.
 

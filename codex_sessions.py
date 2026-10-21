@@ -15,6 +15,7 @@ import sys
 import tempfile
 import textwrap
 import time
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -73,7 +74,8 @@ def session_from_rollout(path: Path, pid: int | None = None) -> dict[str, object
     except (OSError, StopIteration, KeyError, TypeError, json.JSONDecodeError):
         return None
     if (
-        payload.get("source") != "cli" and payload.get("originator") != "codex-tui"
+        isinstance(payload.get("source"), dict)
+        or (payload.get("source") != "cli" and payload.get("originator") != "codex-tui")
         or not SESSION_ID.fullmatch(session_id)
         or not isinstance(cwd, str)
     ):
@@ -100,13 +102,13 @@ def thread_metadata(
     placeholders = ",".join("?" for _ in session_ids)
     database = codex_home / "state_5.sqlite"
     try:
-        with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
+        with closing(sqlite3.connect(f"file:{database}?mode=ro", uri=True)) as connection:
             rows = connection.execute(
                 f"SELECT id, COALESCE(NULLIF(name, ''), title), approval_mode, sandbox_policy "
                 f"FROM threads "
                 f"WHERE id IN ({placeholders})",
                 session_ids,
-            )
+            ).fetchall()
         metadata = {}
         for session_id, label, approval_mode, sandbox_policy in rows:
             metadata[session_id] = (label, is_yolo(approval_mode, sandbox_policy))
@@ -117,9 +119,9 @@ def thread_metadata(
 
 def thread_rollouts(codex_home: Path) -> dict[str, tuple[Path, str]]:
     try:
-        with sqlite3.connect(
+        with closing(sqlite3.connect(
             f"file:{codex_home / 'state_5.sqlite'}?mode=ro", uri=True
-        ) as connection:
+        )) as connection:
             rows = connection.execute(
                 "SELECT id, rollout_path, cwd FROM threads WHERE archived = 0"
             )
@@ -148,13 +150,68 @@ def nearest_session_snapshot(
             same_cwd = os.path.samefile(thread_cwds.get(session_id, ""), cwd)
         except OSError:
             same_cwd = thread_cwds.get(session_id) == cwd
-        if same_cwd and session_id not in found and timestamp >= started_at - 30:
-            matches.append((timestamp, session_id))
-    return min(matches)[1] if matches else None
+        distance = abs(timestamp - started_at)
+        if same_cwd and session_id not in found and distance <= 30:
+            matches.append((distance, timestamp, session_id))
+    return min(matches)[2] if matches else None
+
+
+def resumed_session(
+    codex_home: Path, started_at: float, cwd: str, pid: int
+) -> dict[str, object] | None:
+    try:
+        with closing(sqlite3.connect(
+            f"file:{codex_home / 'logs_2.sqlite'}?mode=ro", uri=True
+        )) as connection:
+            rows = connection.execute(
+                "SELECT DISTINCT thread_id FROM logs WHERE ts BETWEEN ? AND ? "
+                "AND target = 'codex_app_server::request_processors::thread_lifecycle' "
+                "AND feedback_log_body LIKE 'composing running thread resume response %'",
+                (int(started_at) - 30, int(started_at) + 30),
+            ).fetchall()
+        rollouts = thread_rollouts(codex_home)
+        matches = {}
+        for (session_id,) in rows:
+            if session_id not in rollouts:
+                continue
+            path, thread_cwd = rollouts[session_id]
+            if os.path.realpath(thread_cwd) != os.path.realpath(cwd):
+                continue
+            session = session_from_rollout(path, pid)
+            if session:
+                matches[session_id] = session
+        # shortcut: use a unique nearby resume until Codex exposes a TUI/thread ID.
+        if len(matches) > 1:
+            raise SystemExit(
+                f"Ambiguous session for Codex process {pid}. Existing save kept. "
+                "Restart that terminal with codex resume <session-id>."
+            )
+        return next(iter(matches.values())) if len(matches) == 1 else None
+    except sqlite3.Error:
+        return None
+
+
+def cached_session_id(records: list[dict[str, object]], pid: int, process_start: str) -> str | None:
+    for record in records:
+        if (
+            isinstance(record, dict)
+            and record.get("pid") == pid
+            and record.get("process_start") == process_start
+            and isinstance(record.get("id"), str)
+        ):
+            return record["id"]
+    return None
 
 
 def discover_wsl_sessions() -> list[dict[str, object]]:
     codex_home = Path.home() / ".codex"
+    cache_path = codex_home / "session-ritual-processes.json"
+    try:
+        cached = load_manifest(cache_path)["sessions"]
+    except SystemExit:
+        cached = []
+    boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    process_starts = {}
     sessions_root = str(codex_home / "sessions") + os.sep
     rollouts = thread_rollouts(codex_home)
     found: dict[str, dict[str, object]] = {}
@@ -176,8 +233,11 @@ def discover_wsl_sessions() -> list[dict[str, object]]:
                 "/dev/pts/"
             ):
                 continue
+            stat_fields = (process / "stat").read_text().rsplit(")", 1)[1].split()
+            started_ticks = int(stat_fields[19])
+            process_starts[int(process.name)] = f"{boot_id}:{started_ticks}"
             descriptors = (process / "fd").iterdir()
-        except (OSError, PermissionError):
+        except (OSError, ValueError, IndexError):
             continue
 
         session = None
@@ -202,10 +262,9 @@ def discover_wsl_sessions() -> list[dict[str, object]]:
                 found[session_id] = session
                 continue
         try:
-            stat_fields = (process / "stat").read_text().rsplit(")", 1)[1].split()
             unresolved.append(
                 (
-                    booted_at + int(stat_fields[19]) / clock_ticks,
+                    booted_at + started_ticks / clock_ticks,
                     os.readlink(process / "cwd"),
                     int(process.name),
                 )
@@ -222,15 +281,34 @@ def discover_wsl_sessions() -> list[dict[str, object]]:
             except OSError:
                 pass
     thread_cwds = {session_id: record[1] for session_id, record in rollouts.items()}
+    missing = []
     for started_at, cwd, pid in sorted(unresolved):
-        # shortcut: bare Codex uses the first matching snapshot, use a server ID if exposed.
-        session_id = nearest_session_snapshot(
-            cwd, started_at, snapshots, thread_cwds, set(found)
+        session_id = cached_session_id(cached, pid, process_starts[pid])
+        session = session_from_rollout(rollouts[session_id][0], pid) if session_id in rollouts else None
+        if session is None:
+            session = resumed_session(codex_home, started_at, cwd, pid)
+        if session is None:
+            session_id = nearest_session_snapshot(
+                cwd, started_at, snapshots, thread_cwds, set(found)
+            )
+            if session_id:
+                session = session_from_rollout(rollouts[session_id][0], pid)
+        if session:
+            found[str(session["id"])] = session
+        else:
+            missing.append(str(pid))
+
+    write_manifest(
+        [{**session, "process_start": process_starts[int(session["pid"])]}
+         for session in found.values()],
+        cache_path,
+    )
+    if missing:
+        raise SystemExit(
+            f"Cannot identify interactive Codex process(es): {', '.join(missing)}. "
+            "Existing save kept. Select a session in the resume picker, or restart "
+            "that terminal with codex resume <session-id>, then save again."
         )
-        if session_id:
-            session = session_from_rollout(rollouts[session_id][0], pid)
-            if session:
-                found[session_id] = session
 
     metadata = thread_metadata(codex_home, list(found))
     for session_id, session in found.items():
@@ -277,11 +355,12 @@ def run_in_wsl(*arguments: str) -> str:
         WSL_PYTHON,
         "-",
         *arguments,
-        check=True,
         capture_output=True,
         encoding="utf-8",
         input=script,
     )
+    if result.returncode:
+        raise SystemExit(result.stderr.strip() or "WSL session discovery failed.")
     return result.stdout
 
 
@@ -423,13 +502,13 @@ def state_file() -> Path:
     return Path(__file__).resolve().with_name("sessions.json")
 
 
-def write_manifest(sessions: list[dict[str, object]]) -> None:
+def write_manifest(sessions: list[dict[str, object]], destination: Path | None = None) -> None:
     manifest = {
         "version": STATE_VERSION,
         "saved_at": datetime.now(timezone.utc).isoformat(),
         "sessions": sessions,
     }
-    destination = state_file()
+    destination = destination or state_file()
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         "w", encoding="utf-8", dir=destination.parent, delete=False
@@ -643,6 +722,61 @@ def self_test() -> int:
         metadata["payload"].update(source="vscode", originator="codex-tui")
         rollout.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
         assert session_from_rollout(rollout) is not None
+        root = Path(directory)
+        with closing(sqlite3.connect(root / "state_5.sqlite")) as connection, connection:
+            connection.execute(
+                "CREATE TABLE threads (id TEXT, rollout_path TEXT, cwd TEXT, archived INTEGER)"
+            )
+            connection.execute(
+                "INSERT INTO threads VALUES (?, ?, ?, 0)",
+                (session_id, str(rollout), "/tmp/work"),
+            )
+        with closing(sqlite3.connect(root / "logs_2.sqlite")) as connection, connection:
+            connection.execute(
+                "CREATE TABLE logs (ts INTEGER, thread_id TEXT, target TEXT, feedback_log_body TEXT)"
+            )
+            connection.execute(
+                "INSERT INTO logs VALUES (100, ?, ?, ?)",
+                (session_id, "codex_app_server::request_processors::thread_lifecycle",
+                 "composing running thread resume response thread_id=" + session_id),
+            )
+        # A live reattach produces no shell snapshot, but does log the resume.
+        assert resumed_session(root, 101, "/tmp/work", 42) == {
+            "id": session_id, "cwd": "/tmp/work", "pid": 42
+        }
+        assert resumed_session(root, 200, "/tmp/work", 42) is None
+        assert resumed_session(root, 101, "/tmp/other", 42) is None
+        other_id = "fedcba98-7654-3210-fedc-ba9876543210"
+        other_rollout = root / "other.jsonl"
+        metadata["payload"]["id"] = other_id
+        other_rollout.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
+        with closing(sqlite3.connect(root / "state_5.sqlite")) as connection, connection:
+            connection.execute(
+                "INSERT INTO threads VALUES (?, ?, ?, 0)",
+                (other_id, str(other_rollout), "/tmp/work"),
+            )
+        with closing(sqlite3.connect(root / "logs_2.sqlite")) as connection, connection:
+            connection.execute(
+                "INSERT INTO logs SELECT ts, ?, target, feedback_log_body FROM logs",
+                (other_id,),
+            )
+        try:
+            resumed_session(root, 101, "/tmp/work", 42)
+        except SystemExit as error:
+            assert "Ambiguous session" in str(error)
+        else:
+            raise AssertionError("Concurrent resumes must not be guessed")
+        metadata["payload"]["source"] = {"subagent": {}}
+        rollout.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
+        other_rollout.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
+        assert resumed_session(root, 101, "/tmp/work", 42) is None
+        cache = [{"id": session_id, "pid": 42, "process_start": "boot:99"}]
+        write_manifest(cache, root / "cache.json")
+        cached = load_manifest(root / "cache.json")["sessions"]
+        assert cached_session_id(cached, 42, "boot:99") == session_id
+        assert cached_session_id(cached, 43, "boot:99") is None
+        assert cached_session_id(cached, 42, "boot:100") is None
+        assert cached_session_id(cached, 42, "other-boot:99") is None
         try:
             load_manifest(Path(directory) / "sessions.json")
         except SystemExit as error:
@@ -679,12 +813,18 @@ def self_test() -> int:
         == session_id
     )
     assert nearest_session_snapshot(
+        "/tmp/work", 18.0, snapshots, thread_cwds, set()
+    ) == other["id"]
+    assert nearest_session_snapshot(
         "/tmp/work", 18.0, snapshots, thread_cwds, {session_id}
     ) == other["id"]
     assert (
         nearest_session_snapshot("/tmp/work", 51.0, snapshots, thread_cwds, set())
         is None
     )
+    assert nearest_session_snapshot(
+        "/tmp/work", 1.0, [(100.0, session_id)], thread_cwds, set()
+    ) is None
     assert (
         nearest_session_snapshot("/tmp/elsewhere", 5.0, snapshots, thread_cwds, set())
         is None
