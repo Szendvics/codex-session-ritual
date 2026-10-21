@@ -28,6 +28,7 @@ DISTRO = os.environ.get("CODEX_SESSIONS_DISTRO", "Ubuntu")
 WSL_PYTHON = os.environ.get("CODEX_SESSIONS_WSL_PYTHON", "/usr/bin/python3")
 AUTOSAVE_INTERVAL_SECONDS = 60
 WSL_TIMEOUT_SECONDS = 30
+RESTORE_SETTLE_SECONDS = 3
 
 
 def short_title(value: str | None, cwd: str, session_id: str) -> str:
@@ -558,6 +559,7 @@ def wait_for_session(session_id: str) -> None:
     while time.monotonic() < deadline:
         running = {str(session["id"]) for session in discover_from_windows()}
         if session_id in running:
+            time.sleep(RESTORE_SETTLE_SECONDS)
             return
         time.sleep(1)
     raise SystemExit(f"Timed out waiting for Codex session {session_id} to start.")
@@ -687,9 +689,10 @@ def self_test() -> int:
         sys.modules[__name__],
         "discover_from_windows",
         side_effect=[[], [{"id": session_id}]],
-    ) as discover, mock.patch.object(time, "sleep"):
+    ) as discover, mock.patch.object(time, "sleep") as sleep:
         wait_for_session(session_id)
         assert discover.call_count == 2
+        assert sleep.call_args_list == [mock.call(1), mock.call(RESTORE_SETTLE_SECONDS)]
     with mock.patch.object(
         sys.modules[__name__], "discover_from_windows", return_value=[]
     ), mock.patch.object(time, "monotonic", side_effect=[0.0, 0.0, 31.0]), mock.patch.object(

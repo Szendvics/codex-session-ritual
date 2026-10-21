@@ -53,8 +53,8 @@ list every minute, so opened and closed sessions are tracked. If every session
 is closed, the last non-empty snapshot is kept. Press `Ctrl+C` to stop autosave
 without closing sessions.
 
-Restore starts one tab at a time and waits until each exact session ID is
-running before it starts the next tab.
+Restore starts one tab at a time, waits until each exact session ID is running,
+then gives it three seconds to settle before it starts the next tab.
 
 After Codex exits, its WSL tab stays open. The exact resume command is saved in
 Bash history, so Up then Enter restarts the session in the same mode.
