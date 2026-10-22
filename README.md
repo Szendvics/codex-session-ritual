@@ -64,6 +64,9 @@ After Codex exits, its WSL tab stays open. The exact resume command is saved in
 Bash history, so Up then Enter restarts the session in the same mode.
 
 All three commands print numbered, colored session cards. `findSessions`
-searches user and assistant messages only, shows a matching excerpt, and lets
-you open a result by entering its number. It does not require a prior
-`saveSessions`.
+searches user and assistant messages in both older and current transcript
+formats, shows a matching excerpt, and lets you open a result by entering its
+number. The 10 most recently active matching sessions appear first, with local
+date and time based on the transcript's last modification time. Search stops
+once those 10 matches are found; rarer queries still scan the full history.
+It does not require a prior `saveSessions`.

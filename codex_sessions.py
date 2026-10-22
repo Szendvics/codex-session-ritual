@@ -24,6 +24,9 @@ SESSION_ID = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
 TOKENS = re.compile(r"[^\W\d_]+|\d+")
+ROLLOUT_HEADER = re.compile(
+    rb'^\{"timestamp":"[^"]+"(?:,"ordinal":\d+)?,"type":"([^"]+)","payload":\{(?:"type":"([^"]+)")?'
+)
 STATE_VERSION = 1
 DISTRO = os.environ.get("CODEX_SESSIONS_DISTRO", "Ubuntu")
 WSL_PYTHON = os.environ.get("CODEX_SESSIONS_WSL_PYTHON", "/usr/bin/python3")
@@ -368,14 +371,37 @@ def discover_from_windows() -> list[dict[str, object]]:
     return json.loads(run_in_wsl("_discover"))
 
 
-def searchable_message(line: str) -> str | None:
-    if '"type":"event_msg"' not in line or not (
-        '"type":"user_message"' in line or '"type":"agent_message"' in line
-    ):
+def searchable_message(line: bytes) -> str | None:
+    # Skip tool events without scanning or decoding their large payloads.
+    header = ROLLOUT_HEADER.match(line)
+    if header:
+        record_type, item_type = header.groups()
+        if record_type not in {b"event_msg", b"response_item"} or (
+            item_type is not None and (record_type, item_type) not in {
+                (b"event_msg", b"user_message"), (b"event_msg", b"agent_message"),
+                (b"response_item", b"message"),
+            }
+        ):
+            return None
+    if not any(tag in line for tag in (b'"user_message"', b'"agent_message"', b'"message"')):
         return None
     try:
-        message = json.loads(line)["payload"]["message"]
-    except (KeyError, TypeError, json.JSONDecodeError):
+        record = json.loads(line)
+        payload = record["payload"]
+        if record["type"] == "event_msg" and payload.get("type") in {"user_message", "agent_message"}:
+            message = payload.get("message")
+        elif (
+            record["type"] == "response_item" and payload.get("type") == "message"
+            and payload.get("role") in {"user", "assistant"}
+        ):
+            message = "\n".join(
+                part["text"] for part in payload.get("content", [])
+                if isinstance(part, dict) and part.get("type") in {"input_text", "output_text"}
+                and isinstance(part.get("text"), str)
+            )
+        else:
+            return None
+    except (AttributeError, KeyError, TypeError, ValueError):
         return None
     return message if isinstance(message, str) else None
 
@@ -394,49 +420,56 @@ def search_wsl_sessions(query: str) -> list[dict[str, object]]:
     if not terms:
         return []
     matches: list[dict[str, object]] = []
-
+    paths = []
     for path in (Path.home() / ".codex" / "sessions").rglob("*.jsonl"):
-        counts = dict.fromkeys(terms, 0)
+        try:
+            paths.append((path.stat().st_mtime, path))
+        except OSError:
+            continue
+
+    for updated_at, path in sorted(paths, reverse=True):
+        found_terms = set()
         best_context = ""
-        best_quality = (0, 0)
+        best_quality = 0
         session = session_from_rollout(path)
         if not session:
             continue
         try:
-            with path.open(encoding="utf-8") as stream:
+            with path.open("rb") as stream:
                 for line in stream:
                     message = searchable_message(line)
                     if message is None:
                         continue
-                    words = TOKENS.findall(message.casefold())
-                    hits = [words.count(term) for term in terms]
-                    for term, count in zip(terms, hits):
-                        counts[term] += count
-                    quality = (sum(bool(count) for count in hits), sum(hits))
+                    folded = message.casefold()
+                    if not any(term in folded for term in terms):
+                        continue
+                    hits = set(TOKENS.findall(folded)).intersection(terms)
+                    found_terms.update(hits)
+                    quality = len(hits)
                     if quality > best_quality:
                         best_quality = quality
                         best_context = context_excerpt(message, terms)
+                    if found_terms.issuperset(terms):
+                        break
         except OSError:
             continue
-        if all(counts.values()):
-            session["score"] = min(counts.values())
-            session["date"] = "-".join(path.parts[-4:-1])
+        if found_terms.issuperset(terms):
+            session["updated_at"] = updated_at
             session["context"] = best_context
             matches.append(session)
+            if len(matches) == 10:
+                break
 
     metadata = thread_metadata(Path.home() / ".codex", [str(item["id"]) for item in matches])
     for session in matches:
         session_id = str(session["id"])
         label, session["yolo"] = metadata.get(session_id, (None, False))
         session["title"] = short_title(label, str(session["cwd"]), session_id)
-    return sorted(
-        matches,
-        key=lambda item: (int(item["score"]), str(item["date"])),
-        reverse=True,
-    )[:10]
+    return matches
 
 
 def find_sessions(query: str) -> int:
+    print(paint("96", "Searching session history (newest activity first)..."), flush=True)
     sessions = (
         json.loads(run_in_wsl("_search", query))
         if os.name == "nt"
@@ -448,11 +481,9 @@ def find_sessions(query: str) -> int:
 
     print(paint("1", f"Found {len(sessions)} likely session(s) for: {query}"))
     for index, session in enumerate(sessions, 1):
-        score = paint("93", f"score {session['score']}")
-        metadata = (
-            f"{score}  "
-            f"{paint('92', session['date'])}  {paint('95', session['id'])}"
-        )
+        updated_at = datetime.fromtimestamp(float(session["updated_at"])).astimezone()
+        date = updated_at.strftime("%Y-%m-%d %H:%M:%S %z")
+        metadata = f"{paint('92', date)}  {paint('95', session['id'])}"
         print_session_card(index, session, metadata, str(session["context"]))
 
     if os.name == "nt" and sys.stdin.isatty() and sys.stdout.isatty():
@@ -706,6 +737,8 @@ def restore_sessions(dry_run: bool) -> int:
 
 
 def self_test() -> int:
+    from unittest import mock
+
     session_id = "01234567-89ab-cdef-0123-456789abcdef"
     assert short_title("  a   useful title ", "/tmp/work", session_id) == "a useful title"
     assert short_title(None, "/tmp/work", session_id) == "work"
@@ -835,9 +868,70 @@ def self_test() -> int:
         {"type": "event_msg", "payload": {"type": "user_message", "message": "task42 ready"}},
         separators=(",", ":"),
     )
-    assert searchable_message(line) == "task42 ready"
-    assert searchable_message('{"type":"response_item","message":"task 42"}') is None
+    assert searchable_message(line.encode()) == "task42 ready"
+    assert searchable_message(b'{"type":"response_item","message":"task 42"}') is None
+    for role, kind in (("user", "input_text"), ("assistant", "output_text")):
+        message = {"type": "response_item", "payload": {
+            "type": "message", "role": role,
+            "content": [{"type": kind, "text": "crash context"}, {"type": "input_image"}],
+        }}
+        assert searchable_message(json.dumps(message).encode()) == "crash context"
+    message["payload"]["role"] = "developer"
+    assert searchable_message(json.dumps(message).encode()) is None
+    message["payload"].update(type="agent_message", author="/root/helper", recipient="/root")
+    assert searchable_message(json.dumps(message).encode()) is None
+    assert searchable_message(b'{"type":"event_msg","payload":{"type":"agent_message"') is None
+    tool_event = json.dumps({
+        "timestamp": "2026-01-01T00:00:00Z", "ordinal": 1, "type": "event_msg",
+        "payload": {"type": "item_completed", "item": message["payload"]},
+    }, separators=(",", ":")).encode()
+    with mock.patch.object(json, "loads") as parse:
+        assert searchable_message(tool_event) is None
+        assert searchable_message(
+            b'{"timestamp":"2026-01-01T00:00:00Z","type":"compacted","payload":{"message":"crash"}}'
+        ) is None
+        parse.assert_not_called()
     assert "task42" in context_excerpt("before task42 after", ["task", "42"])
+    with tempfile.TemporaryDirectory() as directory:
+        search_home = Path(directory)
+        history = search_home / ".codex" / "sessions" / "2000" / "01" / "01"
+        history.mkdir(parents=True)
+        for index in range(14):
+            search_id = f"00000000-0000-0000-0000-{index:012d}"
+            metadata = {"payload": {
+                "id": search_id, "cwd": "/tmp/work", "originator": "codex-tui",
+                "source": {"subagent": {}} if index == 13 else "cli",
+            }}
+            event = {
+                "type": "response_item" if index == 12 else "event_msg",
+                "payload": {"type": "user_message",
+                            "message": "crash " * (100 if index == 0 else 1)},
+            }
+            if index == 11:
+                event = {"type": "response_item", "payload": {
+                    "type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": "CRASH context"}],
+                }}
+            path = history / f"{search_id}.jsonl"
+            path.write_text(
+                json.dumps(metadata) + "\n"
+                + json.dumps(event, separators=(",", ":")) + "\n", encoding="utf-8",
+            )
+            updated_at = 1_700_000_000 + index * 60
+            os.utime(path, (updated_at, updated_at))
+        with mock.patch.object(Path, "home", return_value=search_home):
+            with mock.patch(
+                f"{__name__}.session_from_rollout", wraps=session_from_rollout
+            ) as read_session:
+                results = search_wsl_sessions("CRASH")
+                assert read_session.call_count == 12
+            assert [item["id"] for item in results] == [
+                f"00000000-0000-0000-0000-{index:012d}" for index in range(11, 1, -1)
+            ]
+            assert results[0]["updated_at"] == 1_700_000_000 + 11 * 60
+            assert search_wsl_sessions("no such query") == []
+            assert search_wsl_sessions("crashes") == []
+            assert search_wsl_sessions("crash crash") == results
     print("Self-test passed.")
     return 0
 
