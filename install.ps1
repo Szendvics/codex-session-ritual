@@ -30,6 +30,9 @@ foreach ($powerShellExecutable in $powerShellExecutables) {
 
 New-Item -ItemType Directory -Force $installDirectory | Out-Null
 py -3.13 -m venv (Join-Path $installDirectory ".venv")
+if ($LASTEXITCODE) { throw "Python 3.13 virtual environment creation failed ($LASTEXITCODE)." }
+& $venvPython -X utf8 "$PSScriptRoot\codex_sessions.py" self-test
+if ($LASTEXITCODE) { throw "Session ritual self-test failed ($LASTEXITCODE); installed files were not replaced." }
 Copy-Item -Path @(
     "$PSScriptRoot\codex_sessions.py",
     "$PSScriptRoot\profile.ps1",
@@ -51,7 +54,8 @@ foreach ($profilePath in $profilePaths) {
     }
 }
 
-& $venvPython (Join-Path $installDirectory "codex_sessions.py") self-test
+& $venvPython -X utf8 (Join-Path $installDirectory "codex_sessions.py") self-test
+if ($LASTEXITCODE) { throw "Installed session ritual self-test failed ($LASTEXITCODE)." }
 foreach ($powerShellExecutable in $powerShellExecutables) {
     & $powerShellExecutable -NonInteractive -Command `
         "Get-Command saveSessions, restoreSessions, findSessions -ErrorAction Stop | Out-Null"
