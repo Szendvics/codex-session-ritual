@@ -169,8 +169,7 @@ def nearest_session_snapshot(
 ) -> str | None:
     matches = set()
     for timestamp, session_id in snapshots:
-        distance = abs(timestamp - started_at)
-        if distance > 30:
+        if not 0 <= timestamp - started_at <= 30:
             continue
         try:
             same_cwd = os.path.samefile(thread_cwds.get(session_id, ""), cwd)
@@ -192,9 +191,10 @@ def resumed_session(
         )) as connection:
             rows = connection.execute(
                 "SELECT DISTINCT thread_id FROM logs WHERE ts BETWEEN ? AND ? "
+                "AND ts + ts_nanos / 1e9 BETWEEN ? AND ? "
                 "AND target = 'codex_app_server::request_processors::thread_lifecycle' "
                 "AND feedback_log_body LIKE 'composing running thread resume response %'",
-                (int(started_at) - 30, int(started_at) + 30),
+                (int(started_at), int(started_at + 30), started_at, started_at + 30),
             ).fetchall()
         rollouts = thread_rollouts(codex_home)
         matches = {}
@@ -224,7 +224,7 @@ def cached_session_id(records: list[dict[str, object]], pid: int, process_start:
             isinstance(record, dict)
             and record.get("pid") == pid
             and record.get("process_start") == process_start
-            and record.get("identity_version") == 2
+            and record.get("identity_version") == 3
             and isinstance(record.get("id"), str)
         ):
             return record["id"]
@@ -352,7 +352,7 @@ def discover_wsl_sessions() -> list[dict[str, object]]:
         session["title"] = short_title(label, str(session["cwd"]), session_id)
         session["process_start"] = process_starts[pid]
     write_manifest(
-        [{**session, "identity_version": 2} for session in found.values()], cache_path,
+        [{**session, "identity_version": 3} for session in found.values()], cache_path,
     )
     return sorted(found.values(), key=lambda session: (str(session["title"]).lower(), str(session["id"])))
 
@@ -894,19 +894,25 @@ def self_test() -> int:
             )
         with closing(sqlite3.connect(root / "logs_2.sqlite")) as connection, connection:
             connection.execute(
-                "CREATE TABLE logs (ts INTEGER, thread_id TEXT, target TEXT, feedback_log_body TEXT)"
+                "CREATE TABLE logs (ts INTEGER, ts_nanos INTEGER, thread_id TEXT, target TEXT, feedback_log_body TEXT)"
             )
             connection.execute(
-                "INSERT INTO logs VALUES (100, ?, ?, ?)",
+                "INSERT INTO logs VALUES (100, 500000000, ?, ?, ?)",
                 (session_id, "codex_app_server::request_processors::thread_lifecycle",
                  "composing running thread resume response thread_id=" + session_id),
             )
         # A live reattach produces no shell snapshot, but does log the resume.
-        assert resumed_session(root, 101, "/tmp/work", 42) == {
+        assert resumed_session(root, 100.25, "/tmp/work", 42) == {
             "id": session_id, "cwd": "/tmp/work", "pid": 42
         }
+        # A pre-start event is invalid even within the same integer second.
+        assert resumed_session(root, 100.75, "/tmp/work", 42) is None
+        assert resumed_session(root, 101, "/tmp/work", 42) is None
+        assert resumed_session(root, 70.25, "/tmp/work", 42) is None
+        assert resumed_session(root, 70.5, "/tmp/work", 42) is not None
+        assert resumed_session(root, 100.5, "/tmp/work", 42) is not None
         assert resumed_session(root, 200, "/tmp/work", 42) is None
-        assert resumed_session(root, 101, "/tmp/other", 42) is None
+        assert resumed_session(root, 100.25, "/tmp/other", 42) is None
         other_id = "fedcba98-7654-3210-fedc-ba9876543210"
         other_rollout = root / "other.jsonl"
         metadata["payload"]["id"] = other_id
@@ -918,11 +924,11 @@ def self_test() -> int:
             )
         with closing(sqlite3.connect(root / "logs_2.sqlite")) as connection, connection:
             connection.execute(
-                "INSERT INTO logs SELECT ts, ?, target, feedback_log_body FROM logs",
+                "INSERT INTO logs SELECT ts, ts_nanos, ?, target, feedback_log_body FROM logs",
                 (other_id,),
             )
         try:
-            resumed_session(root, 101, "/tmp/work", 42)
+            resumed_session(root, 100.25, "/tmp/work", 42)
         except SessionDiscoveryError as error:
             assert "Ambiguous session" in str(error)
         else:
@@ -930,15 +936,16 @@ def self_test() -> int:
         metadata["payload"]["source"] = {"subagent": {}}
         rollout.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
         other_rollout.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
-        assert resumed_session(root, 101, "/tmp/work", 42) is None
-        cache = [{"id": session_id, "pid": 42, "process_start": "boot:99", "identity_version": 2}]
+        assert resumed_session(root, 100.25, "/tmp/work", 42) is None
+        cache = [{"id": session_id, "pid": 42, "process_start": "boot:99", "identity_version": 3}]
         write_manifest(cache, root / "cache.json")
         cached = load_manifest(root / "cache.json")["sessions"]
         assert cached_session_id(cached, 42, "boot:99") == session_id
         assert cached_session_id(cached, 43, "boot:99") is None
         assert cached_session_id(cached, 42, "boot:100") is None
         assert cached_session_id(cached, 42, "other-boot:99") is None
-        assert cached_session_id([{**cache[0], "identity_version": 1}], 42, "boot:99") is None
+        for version in (1, 2):
+            assert cached_session_id([{**cache[0], "identity_version": version}], 42, "boot:99") is None
         try:
             load_manifest(Path(directory) / "sessions.json")
         except SystemExit as error:
@@ -970,11 +977,13 @@ def self_test() -> int:
     snapshots = [(10.0, session_id), (20.0, str(other["id"]))]
     thread_cwds = {session_id: "/tmp/work", str(other["id"]): "/tmp/work"}
     try:
-        nearest_session_snapshot("/tmp/work", 12.0, snapshots, thread_cwds)
+        nearest_session_snapshot("/tmp/work", 9.0, snapshots, thread_cwds)
     except SessionDiscoveryError:
         pass
     else:
         raise AssertionError("Overlapping snapshots must not be guessed")
+    assert nearest_session_snapshot("/tmp/work", 12.0, [snapshots[0]], thread_cwds) is None
+    assert nearest_session_snapshot("/tmp/work", 12.0, snapshots, thread_cwds) == other["id"]
     assert nearest_session_snapshot(
         "/tmp/work", 18.0, [snapshots[1]], thread_cwds
     ) == other["id"]
